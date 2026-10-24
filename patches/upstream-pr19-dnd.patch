@@ -1,0 +1,1427 @@
+From 14c12937b1ddf986737a25af163689f07046a569 Mon Sep 17 00:00:00 2001
+From: Zsolt Mencseli <4507993+zsoltmencseli@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 05:48:02 +0200
+Subject: [PATCH 1/2] Fix drag-and-drop in canvas mode (file DnD and browser
+ tab drag)
+
+---
+ scrollOverview.cpp | 92 ++++++++++++++++++++++++++++++++++++++++++++--
+ scrollOverview.hpp |  1 +
+ 2 files changed, 89 insertions(+), 4 deletions(-)
+
+diff --git a/scrollOverview.cpp b/scrollOverview.cpp
+index 5c9a055..b2b72e4 100644
+--- a/scrollOverview.cpp
++++ b/scrollOverview.cpp
+@@ -29,6 +29,7 @@
+ #include <hyprland/src/config/shared/animation/AnimationTree.hpp>
+ #include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
+ #include <hyprland/src/protocols/PointerConstraints.hpp>
++#include <hyprland/src/protocols/core/DataDevice.hpp>
+ #include <hyprland/src/pointer/PointerController.hpp>
+ #include <hyprland/src/event/EventBus.hpp>
+ #include <hyprland/src/animation/AnimationManager.hpp>
+@@ -117,6 +118,14 @@ static std::string g_canvasCursorShape; // the cursor override the canvases set;
+ static const CScrollOverview* g_linkedLeader = nullptr; // linked screens: whose camera the others take
+ static Time::steady_tp        g_linkedLeaderMovedAt;    // when the leader last moved its own camera
+ static int g_userFollowMouse = 1; // input:follow_mouse as set before the canvas turned it off
++
++// Yield compositor DnD (Files→Files, Nautilus→apps) to Hyprland. Persistent
++// canvas mode cancels mouse moves and pins seat focus to the press window while
++// the button is held, so dndPointerFocus never tracks the drop target.
++static bool canvasCompositorDndActive() {
++    return PROTO::data && PROTO::data->dndActive();
++}
++
+ // Going to a place at 100% shows the minimap for a moment (see canvasPlaceAction).
+ static Time::steady_tp g_minimapFlashStart, g_minimapFlashUntil;
+ static float minimapFlashAlpha(const Time::steady_tp& now) {
+@@ -1628,6 +1637,24 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
+             return;
+         }
+ 
++        // App file / tab DnD (wl_data_device). On the canvas windows are drawn
++        // away from their real (world) positions, so Hyprland's own hit test
++        // and DnD motion are wrong here: the canvas drives the DnD target and
++        // surface-local motion itself, and Hyprland's pointer path is skipped.
++        if (canvasCompositorDndActive()) {
++            if (!canvasForwardedPointerButtons.empty()) {
++                canvasForwardedPointerButtons.clear();
++                canvasForwardedPointerWindow.reset();
++                canvasForwardedPointerSurface.reset();
++            }
++            if (isCanvasDesktop()) {
++                info.cancelled = true;
++                canvasDndPointerMotion();
++                requestInputFrame();
++            }
++            return;
++        }
++
+         info.cancelled = true;
+         requestInputFrame();
+ 
+@@ -1754,6 +1781,15 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
+         }
+ 
+         if (isCanvasDesktop()) {
++            // Release seat during compositor DnD so drop/leave reach the target.
++            if (canvasCompositorDndActive()) {
++                if (!canvasForwardedPointerButtons.empty()) {
++                    canvasForwardedPointerButtons.clear();
++                    canvasForwardedPointerWindow.reset();
++                    canvasForwardedPointerSurface.reset();
++                }
++                return;
++            }
+             lastMousePosLocal         = getOverviewMousePosLocal(pMonitor.lock());
+             const bool LEFT_HANDED    = ScrollOverview::Config::getLeftHanded();
+             const uint32_t MAIN       = LEFT_HANDED ? BTN_RIGHT : BTN_LEFT;
+@@ -2158,7 +2194,10 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
+         if (isCanvasDesktop() && window && window->m_monitor == pMonitor) {
+             if (!isScreensaverWindow(window) && !Fullscreen::controller()->isFullscreen(window)) {
+                 manageCanvasWindow(window, true);
+-                followCanvasWindow(window, false);
++                // During a DnD (e.g. Chromium/Vivaldi tab drag creates its new
++                // toplevel mid-drag) do not fly the camera to the new window.
++                if (!canvasCompositorDndActive())
++                    followCanvasWindow(window, false);
+                 noteCanvasLayoutChanged();
+             }
+         }
+@@ -2226,7 +2265,7 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
+         // launcher focus, task switchers) follows the selected window with the
+         // camera under the top-layer pointer, falling back to the window's
+         // owning output when no dock/menu is involved.
+-        if (isCanvasDesktop() && shouldShowOverviewWindow(overviewWindow) && g_canvasInternalFocusDepth == 0) {
++        if (isCanvasDesktop() && shouldShowOverviewWindow(overviewWindow) && g_canvasInternalFocusDepth == 0 && !canvasCompositorDndActive()) {
+             auto cameraOverview = scrollOverviewForMonitor(overviewWindow->m_monitor.lock());
+             if (g_pInputManager) {
+                 const auto pointerOverview = scrollOverviewAt(g_pInputManager->getMouseCoordsInternal());
+@@ -4941,8 +4980,53 @@ void CScrollOverview::seedCanvasWindows() {
+         manageCanvasWindow(window, true);
+ }
+ 
++void CScrollOverview::canvasDndPointerMotion() {
++    if (!PROTO::data || !PROTO::data->dndActive() || !isCanvasDesktop())
++        return;
++
++    // Hyprland's DnD motion listener measures from the real window position,
++    // which on the canvas is not where the window is drawn. Motion is sent below.
++    PROTO::data->m_dnd.mouseMove.reset();
++
++    CBox                   BOX;
++    Vector2D               WINDOWLOCAL;
++    Vector2D               SURFACELOCAL;
++    SP<CWLSurfaceResource> SURFACE;
++    const auto             WINDOW = canvasDesktopWindowAtPoint(lastMousePosLocal, &BOX, &WINDOWLOCAL);
++    if (WINDOW && WINDOW->wlSurface() && WINDOW->wlSurface()->resource()) {
++        const auto WORLDPOINT = WINDOW->geometricBox(Desktop::View::IGeometric::GEOMETRIC_CURRENT).pos() + WINDOWLOCAL;
++        if (WINDOW->m_isX11) {
++            SURFACE      = WINDOW->wlSurface()->resource();
++            SURFACELOCAL = WINDOWLOCAL * WINDOW->m_X11SurfaceScaledBy;
++        } else
++            SURFACE = Desktop::viewState()->hitTest().windowSurfaceAt(WORLDPOINT, WINDOW, SURFACELOCAL);
++        if (!SURFACE) {
++            SURFACE      = WINDOW->wlSurface()->resource();
++            SURFACELOCAL = Desktop::viewState()->hitTest().surfaceLocalAt(WORLDPOINT, WINDOW, SURFACE);
++        }
++    }
++
++    if (!SURFACE) {
++        // Over empty canvas: leave the last target so a drop here is cancelled.
++        if (g_pSeatManager->m_state.dndPointerFocus) {
++            g_pSeatManager->m_state.dndPointerFocus.reset();
++            g_pSeatManager->m_events.dndPointerFocusChange.emit();
++            PROTO::data->m_dnd.focusedDevice.reset();
++        }
++        return;
++    }
++
++    if (g_pSeatManager->m_state.dndPointerFocus.lock() != SURFACE) {
++        g_pSeatManager->m_state.dndPointerFocus = SURFACE;
++        g_pSeatManager->m_events.dndPointerFocusChange.emit(); // -> updateDrag: leave old, enter new
++    }
++
++    if (const auto DEVICE = PROTO::data->m_dnd.focusedDevice.lock())
++        DEVICE->sendMotion(Time::millis(Time::steadyNow()), SURFACELOCAL);
++}
++
+ void CScrollOverview::forwardCanvasPointerMotion(uint32_t timeMs) {
+-    if (!isCanvasDesktop() || !ScrollOverview::Config::getCanvasDirectInput() || spacePanHeld || scrollingPanPointerDown || dragActiveWindow || resizeActiveWindow)
++    if (!isCanvasDesktop() || !ScrollOverview::Config::getCanvasDirectInput() || spacePanHeld || scrollingPanPointerDown || dragActiveWindow || resizeActiveWindow || canvasCompositorDndActive())
+         return;
+ 
+     CBox       BOX;
+@@ -5025,7 +5109,7 @@ void CScrollOverview::forwardCanvasPointerMotion(uint32_t timeMs) {
+ }
+ 
+ bool CScrollOverview::forwardCanvasPointerButton(const IPointer::SButtonEvent& event) {
+-    if (!isCanvasDesktop() || !ScrollOverview::Config::getCanvasDirectInput())
++    if (!isCanvasDesktop() || !ScrollOverview::Config::getCanvasDirectInput() || canvasCompositorDndActive())
+         return false;
+ 
+     if (event.state == WL_POINTER_BUTTON_STATE_PRESSED)
+diff --git a/scrollOverview.hpp b/scrollOverview.hpp
+index 6d86eaf..583bff5 100644
+--- a/scrollOverview.hpp
++++ b/scrollOverview.hpp
+@@ -216,6 +216,7 @@ class CScrollOverview : public IOverview {
+     void         ensureCanvasKeyboardFocus(PHLWINDOW window = {});
+     void         seedCanvasWindows();
+     void         forwardCanvasPointerMotion(uint32_t timeMs = 0);
++    void         canvasDndPointerMotion();
+     bool         forwardCanvasPointerButton(const IPointer::SButtonEvent& event);
+     bool         forwardCanvasPointerAxis(const IPointer::SAxisEvent& event);
+     Vector2D     canvasCellForWorkspaceIndex(size_t workspaceIdx) const;
+
+From d1a06ab6d11d280c0b47f09d48f9ac4a42ca8094 Mon Sep 17 00:00:00 2001
+From: Zsolt Mencseli <4507993+zsoltmencseli@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 12:40:49 +0200
+Subject: [PATCH 2/2] Canvas DnD: take over only over canvas windows, keep
+ Hyprland's drag motion
+
+Review follow-up for #19. The first version reset Hyprland's drag-motion
+listener on the first canvas motion, so for the rest of the drag targets
+that Hyprland focuses itself (a fullscreen window on another monitor, a
+panel on the top layer) got enter but no motion.
+
+Now the canvas only drives a drag while the pointer is over a window it
+draws, on its own monitor (CanvasDndRoute.hpp):
+- canvas window: the canvas picks the target and sends surface-local motion;
+- top/overlay layer surface under the pointer: Hyprland (panels win over
+  canvas windows at the same point);
+- another monitor, or a monitor whose canvas stepped aside for a fullscreen
+  window: Hyprland;
+- empty canvas: no target, so a drop there cancels;
+- after the drop, until the target finishes: the canvas holds still.
+
+Hyprland's drag-motion listener stays installed for the whole drag. It is
+held back only while the drag target is the canvas-picked window (for that
+surface it measures from the real position); when Hyprland moves the target
+elsewhere its motion runs unchanged. The hold-back is per drag, forgotten
+when the drag ends, and undone on plugin unload.
+
+Buttons are never swallowed during a drag (the release is the drop,
+wherever it lands), and Escape is left to Hyprland so it can cancel. The
+camera/focus-follow guards for windows opening mid-drag stay.
+
+Tests: tests/canvas-dnd-route-test.cpp (make test-dnd-route) checks the
+routing and replays the review's cases against a model of Hyprland's drag
+handling; tests/dnd-nested.py drives a real drag in a nested two-monitor
+session (canvas window, top-layer panel, fullscreen window on the other
+monitor, drop on empty canvas, repeat, source killed mid-drag).
+---
+ CONTRIBUTING.md                 |   2 +
+ CanvasDnd.cpp                   | 135 ++++++++++++++++
+ CanvasDnd.hpp                   |  37 +++++
+ CanvasDndRoute.hpp              |  84 ++++++++++
+ Makefile                        |  10 +-
+ main.cpp                        |   2 +
+ scrollOverview.cpp              | 151 ++++++++++--------
+ scrollOverview.hpp              |   3 +-
+ tests/canvas-dnd-route-test.cpp | 267 ++++++++++++++++++++++++++++++++
+ tests/dnd-nested.py             | 222 ++++++++++++++++++++++++++
+ tests/tools/dnd-app.py          |  99 ++++++++++++
+ 11 files changed, 942 insertions(+), 70 deletions(-)
+ create mode 100644 CanvasDnd.cpp
+ create mode 100644 CanvasDnd.hpp
+ create mode 100644 CanvasDndRoute.hpp
+ create mode 100644 tests/canvas-dnd-route-test.cpp
+ create mode 100644 tests/dnd-nested.py
+ create mode 100644 tests/tools/dnd-app.py
+
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 809da67..bc5efea 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -14,6 +14,8 @@ make                                   # builds spatialoverview.so
+ make test-tools                        # the virtual mouse some tests use
+ python3 tests/navigator-nested.py --plugin spatialoverview.so
+ python3 tests/popup-nested.py spatialoverview.so
++make test-dnd-route                    # drag-and-drop routing, no compositor needed
++python3 tests/dnd-nested.py spatialoverview.so
+ ```
+ 
+ Each test opens Hyprland in a window of its own and closes it again; nothing
+diff --git a/CanvasDnd.cpp b/CanvasDnd.cpp
+new file mode 100644
+index 0000000..7411ebd
+--- /dev/null
++++ b/CanvasDnd.cpp
+@@ -0,0 +1,135 @@
++// Standard headers first: they must not see the access override below.
++#include <algorithm>
++#include <any>
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <expected>
++#include <format>
++#include <functional>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <ranges>
++#include <span>
++#include <sstream>
++#include <string>
++#include <unordered_map>
++#include <utility>
++#include <variant>
++#include <vector>
++
++// Hyprland's drag state and the signal listener's handler are private.
++#define private public
++#define protected public
++#include <hyprutils/signal/Listener.hpp>
++#include <hyprland/src/protocols/core/DataDevice.hpp>
++#include <hyprland/src/protocols/core/Compositor.hpp>
++#include <hyprland/src/managers/SeatManager.hpp>
++#include <hyprland/src/helpers/time/Time.hpp>
++#undef private
++#undef protected
++
++#include "CanvasDnd.hpp"
++
++namespace SpatialOverview::CanvasDnd {
++    namespace {
++        // The surface the canvas picked as the drag target, if it still is.
++        WP<CWLSurfaceResource> g_canvasTarget;
++        SCanvasPick            g_pick;
++        // Hyprland's drag-motion listener of the current drag, and its own
++        // handler, kept so it can be put back as it was.
++        WP<Hyprutils::Signal::CSignalListener> g_wrappedListener;
++        std::function<void(void*)>             g_hyprlandHandler;
++
++        void forgetPick() {
++            g_canvasTarget.reset();
++            g_pick.forget();
++        }
++
++        bool holdBackHyprlandMotionNow() {
++            if (g_canvasTarget.expired())
++                forgetPick();
++            const auto TARGET = g_pSeatManager ? g_pSeatManager->m_state.dndPointerFocus.lock() : SP<CWLSurfaceResource>{};
++            const bool HOLD   = g_pick.holdBack(TARGET.get());
++            if (!g_pick.surface)
++                g_canvasTarget.reset();
++            return HOLD;
++        }
++
++        void forgetDrag() {
++            forgetPick();
++            g_wrappedListener.reset();
++            g_hyprlandHandler = nullptr;
++        }
++    }
++
++    bool active() {
++        return PROTO::data && PROTO::data->dndActive();
++    }
++
++    bool buttonHeld() {
++        // Armed by initiateDrag, dropped together with the drop.
++        return active() && !!PROTO::data->m_dnd.mouseButton;
++    }
++
++    void sync() {
++        if (!active()) {
++            forgetDrag();
++            return;
++        }
++
++        const auto& LISTENER = PROTO::data->m_dnd.mouseMove;
++        if (!LISTENER || (!g_wrappedListener.expired() && LISTENER.get() == g_wrappedListener.get()))
++            return;
++
++        // A new drag. Hyprland's motion listener measures from the target's
++        // real position. Keep it, and only skip it while the target is a
++        // canvas-drawn window (the canvas sends that motion itself); for any
++        // other target it runs unchanged.
++        forgetPick();
++        g_wrappedListener = LISTENER;
++        g_hyprlandHandler = LISTENER->m_fHandler;
++        LISTENER->m_fHandler = [hyprland = g_hyprlandHandler](void* args) {
++            if (holdBackHyprlandMotionNow())
++                return;
++            hyprland(args);
++        };
++    }
++
++    void focusCanvasTarget(SP<CWLSurfaceResource> surface, const Vector2D& surfaceLocal) {
++        if (!active() || !surface)
++            return;
++
++        g_canvasTarget = surface;
++        g_pick.pick(surface.get());
++        if (g_pSeatManager->m_state.dndPointerFocus.lock() != surface) {
++            g_pSeatManager->m_state.dndPointerFocus = surface;
++            g_pSeatManager->m_events.dndPointerFocusChange.emit(); // Hyprland's updateDrag: leave the old target, enter this one
++        }
++
++        if (const auto DEVICE = PROTO::data->m_dnd.focusedDevice.lock())
++            DEVICE->sendMotion(Time::millis(Time::steadyNow()), surfaceLocal);
++    }
++
++    void clearTarget() {
++        forgetPick();
++        if (!active() || !g_pSeatManager->m_state.dndPointerFocus)
++            return;
++
++        g_pSeatManager->m_state.dndPointerFocus.reset();
++        g_pSeatManager->m_events.dndPointerFocusChange.emit(); // sends leave; no new target
++        PROTO::data->m_dnd.focusedDevice.reset();               // so a drop here cancels the drag
++    }
++
++    void canvasGone() {
++        forgetPick();
++    }
++
++    void shutdown() {
++        if (const auto LISTENER = g_wrappedListener.lock(); LISTENER && g_hyprlandHandler)
++            LISTENER->m_fHandler = g_hyprlandHandler;
++        forgetDrag();
++    }
++}
+diff --git a/CanvasDnd.hpp b/CanvasDnd.hpp
+new file mode 100644
+index 0000000..b1eb2f6
+--- /dev/null
++++ b/CanvasDnd.hpp
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include "CanvasDndRoute.hpp"
++
++#include <hyprland/src/helpers/math/Math.hpp>
++#include <hyprland/src/helpers/memory/Memory.hpp>
++
++class CWLSurfaceResource;
++
++// wl_data_device drags (file drag, browser tab drag) on the canvas. The
++// canvas only takes over while the pointer is over a canvas-drawn window; see
++// CanvasDndRoute.hpp for who drives the drag where.
++namespace SpatialOverview::CanvasDnd {
++    // A drag is in progress (also after the drop, until the target finishes).
++    bool active();
++    // The drag has not been dropped yet.
++    bool buttonHeld();
++
++    // Call on every pointer motion before routing it: forgets the last drag
++    // once it has ended, and arms the hold-back on Hyprland's drag-motion
++    // listener when a new drag has started.
++    void sync();
++
++    // The canvas picked this surface as the target: focus it (leave/enter as
++    // needed) and send it surface-local motion. Hyprland's motion is held back
++    // while this surface stays the target; anything else (a panel, a
++    // fullscreen window, another monitor) Hyprland targets and moves itself.
++    void focusCanvasTarget(SP<CWLSurfaceResource> surface, const Vector2D& surfaceLocal);
++    // Over empty canvas: leave the current target, so a drop here is cancelled.
++    void clearTarget();
++    // A canvas went away: what it picked is not drawn by it any more, so
++    // Hyprland's drag motion is no longer held back for it.
++    void canvasGone();
++
++    // Plugin unload: put Hyprland's own drag-motion handler back.
++    void shutdown();
++}
+diff --git a/CanvasDndRoute.hpp b/CanvasDndRoute.hpp
+new file mode 100644
+index 0000000..05a4337
+--- /dev/null
++++ b/CanvasDndRoute.hpp
+@@ -0,0 +1,84 @@
++#pragma once
++
++// Who drives a wl_data_device drag (file drag, browser tab drag) while the
++// pointer moves. Kept free of Hyprland types so tests/canvas-dnd-route-test.cpp
++// can check it on its own.
++//
++// On a canvas monitor, windows are drawn away from their real (world)
++// position, so Hyprland's hit test and its drag-motion listener (which
++// measures from the real position) are wrong for them. Everything else (a
++// panel on the top/overlay layer, a fullscreen window, a monitor without a
++// canvas) is where Hyprland thinks it is, so Hyprland keeps driving those.
++namespace SpatialOverview::CanvasDnd {
++    enum class ERoute {
++        NOT_DRAGGING,  // no drag: the normal canvas pointer path
++        HYPRLAND,      // Hyprland's own hit test, focus and drag motion
++        CANVAS_TARGET, // a canvas-drawn window: the canvas picks it and sends motion
++        CANVAS_EMPTY,  // empty canvas: no target, so a drop here is cancelled
++        DROPPED,       // dropped, waiting for the target to finish: hold still
++    };
++
++    struct SPointerProbe {
++        bool dragActive          = false; // PROTO::data->dndActive()
++        bool buttonHeld          = false; // not yet dropped (Hyprland's button listener is armed)
++        bool pointerOnThisCanvas = false; // the pointer is on a canvas-desktop monitor and this canvas owns it
++        bool closing             = false; // the canvas is closing
++        bool layerAbove          = false; // a top/overlay layer surface (panel, launcher) is under the pointer
++        bool canvasWindowBelow   = false; // a canvas-drawn window with a surface is under the pointer
++    };
++
++    constexpr ERoute route(const SPointerProbe& p) {
++        if (!p.dragActive)
++            return ERoute::NOT_DRAGGING;
++        if (!p.pointerOnThisCanvas || p.closing)
++            return ERoute::HYPRLAND;
++        if (!p.buttonHeld)
++            return ERoute::DROPPED;
++        // Panels sit above the canvas, at their real position: they win.
++        if (p.layerAbove)
++            return ERoute::HYPRLAND;
++        if (p.canvasWindowBelow)
++            return ERoute::CANVAS_TARGET;
++        return ERoute::CANVAS_EMPTY;
++    }
++
++    // Hyprland's drag-motion listener stays installed for the whole drag. It is
++    // held back only while the drag target is the window the canvas picked:
++    // for that surface it would measure from the wrong place. Hyprland runs it
++    // before its own hit test, so when the pointer leaves the canvas window
++    // for a panel or another monitor, that one event still goes to the canvas
++    // window and is held back too; once Hyprland has moved the target
++    // elsewhere the pick is forgotten and every motion goes through.
++    constexpr bool holdBackHyprlandMotion(bool canvasPickedTarget, bool targetIsCanvasPick) {
++        return canvasPickedTarget && targetIsCanvasPick;
++    }
++
++    // The canvas pick, by surface identity (only compared, never dereferenced).
++    struct SCanvasPick {
++        const void* surface = nullptr;
++
++        void        pick(const void* s) {
++            surface = s;
++        }
++        void forget() {
++            surface = nullptr;
++        }
++        // From Hyprland's drag-motion listener, with the current target.
++        bool holdBack(const void* target) {
++            if (surface && surface != target)
++                surface = nullptr;
++            return holdBackHyprlandMotion(!!surface, surface && surface == target);
++        }
++    };
++
++    constexpr const char* routeName(ERoute r) {
++        switch (r) {
++            case ERoute::NOT_DRAGGING: return "not-dragging";
++            case ERoute::HYPRLAND: return "hyprland";
++            case ERoute::CANVAS_TARGET: return "canvas-target";
++            case ERoute::CANVAS_EMPTY: return "canvas-empty";
++            case ERoute::DROPPED: return "dropped";
++        }
++        return "?";
++    }
++}
+diff --git a/Makefile b/Makefile
+index 3772a70..b99f61d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -10,7 +10,7 @@ VERSION_SCRIPT = scripts/generate-plugin-version.sh
+ OUT ?= spatialoverview.so
+ OBJDIR = .build/obj
+ 
+-SOURCES = main.cpp BarrelShader.cpp Config.cpp DropIndicator.cpp Experiments.cpp Hud.cpp Icons.cpp Memory.cpp Navigator.cpp OverviewGesture.cpp OverviewManager.cpp \
++SOURCES = main.cpp BarrelShader.cpp CanvasDnd.cpp Config.cpp DropIndicator.cpp Experiments.cpp Hud.cpp Icons.cpp Memory.cpp Navigator.cpp OverviewGesture.cpp OverviewManager.cpp \
+           OverviewPassElement.cpp OverviewRender.cpp Popups.cpp Cursor.cpp Tuning.cpp Window.cpp scrollOverview.cpp
+ OBJECTS = $(SOURCES:%.cpp=$(OBJDIR)/%.o)
+ PKGS    = pixman-1 libdrm hyprland pangocairo libinput libudev wayland-server xkbcommon '$(LUA_PKG) >= 5.4'
+@@ -20,7 +20,7 @@ ifeq ($(CXX),g++)
+     EXTRA_FLAGS += -fno-gnu-unique
+ endif
+ 
+-.PHONY: all clean safe-unload test-tools FORCE
++.PHONY: all clean safe-unload test-tools test-dnd-route FORCE
+ 
+ all: $(OBJECTS)
+ 	@mkdir -p $(dir $(OUT))
+@@ -62,6 +62,12 @@ $(VPOINTER): tests/tools/vpointer.c $(VPOINTER_PROTOCOL)
+ 	wayland-scanner private-code $(VPOINTER_PROTOCOL) .build/vpointer-gen/wlr-virtual-pointer-unstable-v1-protocol.c
+ 	$(CC) -O2 -I.build/vpointer-gen $< .build/vpointer-gen/wlr-virtual-pointer-unstable-v1-protocol.c -lwayland-client -lm -o $@
+ 
++# Who drives a drag on the canvas, without a compositor (CanvasDndRoute.hpp).
++test-dnd-route:
++	@mkdir -p .build
++	$(CXX) -std=c++2b -Wall -Wextra -I. tests/canvas-dnd-route-test.cpp -o .build/canvas-dnd-route-test
++	.build/canvas-dnd-route-test
++
+ # Helper that install-live.sh loads to unload the running build safely.
+ SAFE_UNLOAD = .build/safe-unload.so
+ 
+diff --git a/main.cpp b/main.cpp
+index 54bcf2e..2abb87d 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -28,6 +28,7 @@ using namespace Hyprutils::String;
+ #include "Config.hpp"
+ #include "PluginVersion.hpp"
+ #include "scrollOverview.hpp"
++#include "CanvasDnd.hpp"
+ #include "BarrelShader.hpp"
+ #include "Experiments.hpp"
+ #include "Hud.hpp"
+@@ -970,6 +971,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
+         HyprlandAPI::unregisterHyprCtlCommand(SCROLLOVERVIEW_HANDLE, g_stateCommand);
+     g_stateCommand.reset();
+     canvasFullscreenReset();
++    SpatialOverview::CanvasDnd::shutdown();
+     clearScrollOverviews();
+     disableScrollOverviewHooks();
+     canvasReleaseX11Windows();
+diff --git a/scrollOverview.cpp b/scrollOverview.cpp
+index b2b72e4..ed0dc8e 100644
+--- a/scrollOverview.cpp
++++ b/scrollOverview.cpp
+@@ -1,4 +1,5 @@
+ #include "scrollOverview.hpp"
++#include "CanvasDnd.hpp"
+ #include <algorithm>
+ #include <any>
+ #include <array>
+@@ -29,7 +30,6 @@
+ #include <hyprland/src/config/shared/animation/AnimationTree.hpp>
+ #include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
+ #include <hyprland/src/protocols/PointerConstraints.hpp>
+-#include <hyprland/src/protocols/core/DataDevice.hpp>
+ #include <hyprland/src/pointer/PointerController.hpp>
+ #include <hyprland/src/event/EventBus.hpp>
+ #include <hyprland/src/animation/AnimationManager.hpp>
+@@ -119,11 +119,9 @@ static const CScrollOverview* g_linkedLeader = nullptr; // linked screens: whose
+ static Time::steady_tp        g_linkedLeaderMovedAt;    // when the leader last moved its own camera
+ static int g_userFollowMouse = 1; // input:follow_mouse as set before the canvas turned it off
+ 
+-// Yield compositor DnD (Files→Files, Nautilus→apps) to Hyprland. Persistent
+-// canvas mode cancels mouse moves and pins seat focus to the press window while
+-// the button is held, so dndPointerFocus never tracks the drop target.
++// wl_data_device drags (file drag, browser tab drag): see CanvasDnd.hpp.
+ static bool canvasCompositorDndActive() {
+-    return PROTO::data && PROTO::data->dndActive();
++    return SpatialOverview::CanvasDnd::active();
+ }
+ 
+ // Going to a place at 100% shows the minimap for a moment (see canvasPlaceAction).
+@@ -1429,6 +1427,8 @@ static void moveOverviewTargetNextToWindow(const SP<Layout::ITarget>& target, co
+ CScrollOverview::~CScrollOverview() {
+     if (g_pointerGrabOverview == this)
+         g_pointerGrabOverview = nullptr;
++    // A drag target this canvas picked is no longer drawn by it.
++    SpatialOverview::CanvasDnd::canvasGone();
+     transferSharedStateOwnership();
+     restoreSubmapIfActive();
+     if (const auto OPENGL = g_pHyprRenderer ? g_pHyprRenderer->glBackend() : WP<Render::GL::CHyprOpenGLImpl>{})
+@@ -1581,6 +1581,10 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
+             return;
+         const auto INPUTOVERVIEW = scrollOverviewAt(g_pInputManager->getMouseCoordsInternal());
+ 
++        // A drag the canvas does not own is Hyprland's, motion and all.
++        if (canvasCompositorDndActive() && routeCanvasDndMotion(INPUTOVERVIEW, info))
++            return;
++
+         if (closing || (g_pointerGrabOverview && g_pointerGrabOverview != this) || (!g_pointerGrabOverview && INPUTOVERVIEW.get() != this))
+             return;
+ 
+@@ -1637,24 +1641,6 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
+             return;
+         }
+ 
+-        // App file / tab DnD (wl_data_device). On the canvas windows are drawn
+-        // away from their real (world) positions, so Hyprland's own hit test
+-        // and DnD motion are wrong here: the canvas drives the DnD target and
+-        // surface-local motion itself, and Hyprland's pointer path is skipped.
+-        if (canvasCompositorDndActive()) {
+-            if (!canvasForwardedPointerButtons.empty()) {
+-                canvasForwardedPointerButtons.clear();
+-                canvasForwardedPointerWindow.reset();
+-                canvasForwardedPointerSurface.reset();
+-            }
+-            if (isCanvasDesktop()) {
+-                info.cancelled = true;
+-                canvasDndPointerMotion();
+-                requestInputFrame();
+-            }
+-            return;
+-        }
+-
+         info.cancelled = true;
+         requestInputFrame();
+ 
+@@ -1740,6 +1726,19 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
+         if (info.cancelled || sessionLocked())
+             return;
+ 
++        // During a drag the release is the drop: Hyprland's drag listener and
++        // input path must get it, whichever screen or surface it lands on.
++        if (canvasCompositorDndActive()) {
++            if (!canvasForwardedPointerButtons.empty()) {
++                canvasForwardedPointerButtons.clear();
++                canvasForwardedPointerWindow.reset();
++                canvasForwardedPointerSurface.reset();
++            }
++            if (event.state == WL_POINTER_BUTTON_STATE_RELEASED)
++                g_topLayerPointerButtons.erase(event.button); // a drag that began on a panel
++            return;
++        }
++
+         const bool FORWARDEDTOPLAYERRELEASE =
+             event.state == WL_POINTER_BUTTON_STATE_RELEASED && g_topLayerPointerButtons.contains(event.button);
+         const auto INPUTOVERVIEW = scrollOverviewAt(g_pInputManager->getMouseCoordsInternal());
+@@ -1781,15 +1780,6 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
+         }
+ 
+         if (isCanvasDesktop()) {
+-            // Release seat during compositor DnD so drop/leave reach the target.
+-            if (canvasCompositorDndActive()) {
+-                if (!canvasForwardedPointerButtons.empty()) {
+-                    canvasForwardedPointerButtons.clear();
+-                    canvasForwardedPointerWindow.reset();
+-                    canvasForwardedPointerSurface.reset();
+-                }
+-                return;
+-            }
+             lastMousePosLocal         = getOverviewMousePosLocal(pMonitor.lock());
+             const bool LEFT_HANDED    = ScrollOverview::Config::getLeftHanded();
+             const uint32_t MAIN       = LEFT_HANDED ? BTN_RIGHT : BTN_LEFT;
+@@ -2330,6 +2320,10 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
+         } else if (event.state == WL_KEYBOARD_KEY_STATE_PRESSED)
+             SpatialOverview::Navigator::takeConsumed(event.keycode); // a fresh press means its old release was lost
+ 
++        // Escape cancels a drag; Hyprland does that once the key reaches it.
++        if (KEYSYM == XKB_KEY_Escape && canvasCompositorDndActive())
++            return;
++
+         if (closing || activeScrollOverview().get() != this)
+             return;
+ 
+@@ -4980,49 +4974,72 @@ void CScrollOverview::seedCanvasWindows() {
+         manageCanvasWindow(window, true);
+ }
+ 
+-void CScrollOverview::canvasDndPointerMotion() {
+-    if (!PROTO::data || !PROTO::data->dndActive() || !isCanvasDesktop())
+-        return;
++SP<CWLSurfaceResource> CScrollOverview::canvasDndTargetAt(const Vector2D& point, Vector2D& surfaceLocal) const {
++    CBox       BOX;
++    Vector2D   WINDOWLOCAL;
++    const auto WINDOW = canvasDesktopWindowAtPoint(point, &BOX, &WINDOWLOCAL);
++    if (!WINDOW || !WINDOW->wlSurface() || !WINDOW->wlSurface()->resource())
++        return {};
+ 
+-    // Hyprland's DnD motion listener measures from the real window position,
+-    // which on the canvas is not where the window is drawn. Motion is sent below.
+-    PROTO::data->m_dnd.mouseMove.reset();
++    SP<CWLSurfaceResource> surface;
++    const auto             WORLDPOINT = WINDOW->geometricBox(Desktop::View::IGeometric::GEOMETRIC_CURRENT).pos() + WINDOWLOCAL;
++    if (WINDOW->m_isX11) {
++        surface      = WINDOW->wlSurface()->resource();
++        surfaceLocal = WINDOWLOCAL * WINDOW->m_X11SurfaceScaledBy;
++    } else
++        surface = Desktop::viewState()->hitTest().windowSurfaceAt(WORLDPOINT, WINDOW, surfaceLocal);
++    if (!surface) {
++        surface      = WINDOW->wlSurface()->resource();
++        surfaceLocal = Desktop::viewState()->hitTest().surfaceLocalAt(WORLDPOINT, WINDOW, surface);
++    }
++    return surface;
++}
+ 
+-    CBox                   BOX;
+-    Vector2D               WINDOWLOCAL;
+-    Vector2D               SURFACELOCAL;
+-    SP<CWLSurfaceResource> SURFACE;
+-    const auto             WINDOW = canvasDesktopWindowAtPoint(lastMousePosLocal, &BOX, &WINDOWLOCAL);
+-    if (WINDOW && WINDOW->wlSurface() && WINDOW->wlSurface()->resource()) {
+-        const auto WORLDPOINT = WINDOW->geometricBox(Desktop::View::IGeometric::GEOMETRIC_CURRENT).pos() + WINDOWLOCAL;
+-        if (WINDOW->m_isX11) {
+-            SURFACE      = WINDOW->wlSurface()->resource();
+-            SURFACELOCAL = WINDOWLOCAL * WINDOW->m_X11SurfaceScaledBy;
+-        } else
+-            SURFACE = Desktop::viewState()->hitTest().windowSurfaceAt(WORLDPOINT, WINDOW, SURFACELOCAL);
+-        if (!SURFACE) {
+-            SURFACE      = WINDOW->wlSurface()->resource();
+-            SURFACELOCAL = Desktop::viewState()->hitTest().surfaceLocalAt(WORLDPOINT, WINDOW, SURFACE);
+-        }
++bool CScrollOverview::routeCanvasDndMotion(const SP<IOverview>& inputOverview, Event::SCallbackInfo& info) {
++    namespace Dnd = SpatialOverview::CanvasDnd;
++    Dnd::sync();
++
++    // Another screen: its own canvas routes it, or, with no canvas there (none,
++    // or it stepped aside for a fullscreen window), Hyprland targets and moves
++    // the drag itself.
++    if (inputOverview.get() != this)
++        return true;
++
++    // The drag owns the pointer: a button forwarded before it began is gone.
++    if (!canvasForwardedPointerButtons.empty()) {
++        canvasForwardedPointerButtons.clear();
++        canvasForwardedPointerWindow.reset();
++        canvasForwardedPointerSurface.reset();
+     }
+ 
+-    if (!SURFACE) {
+-        // Over empty canvas: leave the last target so a drop here is cancelled.
+-        if (g_pSeatManager->m_state.dndPointerFocus) {
+-            g_pSeatManager->m_state.dndPointerFocus.reset();
+-            g_pSeatManager->m_events.dndPointerFocusChange.emit();
+-            PROTO::data->m_dnd.focusedDevice.reset();
+-        }
+-        return;
++    lastMousePosLocal = getOverviewMousePosLocal(pMonitor.lock());
++
++    Vector2D               surfaceLocal;
++    SP<CWLSurfaceResource> target;
++    Dnd::SPointerProbe     probe{
++                 .dragActive          = true,
++                 .buttonHeld          = Dnd::buttonHeld(),
++                 .pointerOnThisCanvas = isCanvasDesktop(),
++                 .closing             = closing,
++                 .layerAbove          = isPointerOnTopLayer(pMonitor.lock()),
++    };
++    if (probe.pointerOnThisCanvas && !probe.closing && probe.buttonHeld && !probe.layerAbove) {
++        target                  = canvasDndTargetAt(lastMousePosLocal, surfaceLocal);
++        probe.canvasWindowBelow = !!target;
+     }
+ 
+-    if (g_pSeatManager->m_state.dndPointerFocus.lock() != SURFACE) {
+-        g_pSeatManager->m_state.dndPointerFocus = SURFACE;
+-        g_pSeatManager->m_events.dndPointerFocusChange.emit(); // -> updateDrag: leave old, enter new
++    switch (Dnd::route(probe)) {
++        case Dnd::ERoute::NOT_DRAGGING: return false;
++        case Dnd::ERoute::HYPRLAND: return true; // not cancelled: Hyprland's hit test and motion
++        case Dnd::ERoute::DROPPED: info.cancelled = true; return true;
++        case Dnd::ERoute::CANVAS_TARGET: Dnd::focusCanvasTarget(target, surfaceLocal); break;
++        case Dnd::ERoute::CANVAS_EMPTY: Dnd::clearTarget(); break;
+     }
+ 
+-    if (const auto DEVICE = PROTO::data->m_dnd.focusedDevice.lock())
+-        DEVICE->sendMotion(Time::millis(Time::steadyNow()), SURFACELOCAL);
++    // Hyprland would hit-test canvas windows at their real position here.
++    info.cancelled = true;
++    requestInputFrame();
++    return true;
+ }
+ 
+ void CScrollOverview::forwardCanvasPointerMotion(uint32_t timeMs) {
+diff --git a/scrollOverview.hpp b/scrollOverview.hpp
+index 583bff5..acaac8c 100644
+--- a/scrollOverview.hpp
++++ b/scrollOverview.hpp
+@@ -216,7 +216,8 @@ class CScrollOverview : public IOverview {
+     void         ensureCanvasKeyboardFocus(PHLWINDOW window = {});
+     void         seedCanvasWindows();
+     void         forwardCanvasPointerMotion(uint32_t timeMs = 0);
+-    void         canvasDndPointerMotion();
++    SP<CWLSurfaceResource> canvasDndTargetAt(const Vector2D& point, Vector2D& surfaceLocal) const;
++    bool         routeCanvasDndMotion(const SP<IOverview>& inputOverview, Event::SCallbackInfo& info);
+     bool         forwardCanvasPointerButton(const IPointer::SButtonEvent& event);
+     bool         forwardCanvasPointerAxis(const IPointer::SAxisEvent& event);
+     Vector2D     canvasCellForWorkspaceIndex(size_t workspaceIdx) const;
+diff --git a/tests/canvas-dnd-route-test.cpp b/tests/canvas-dnd-route-test.cpp
+new file mode 100644
+index 0000000..d5fb8e8
+--- /dev/null
++++ b/tests/canvas-dnd-route-test.cpp
+@@ -0,0 +1,267 @@
++// Who drives a wl_data_device drag on the canvas (CanvasDndRoute.hpp), checked
++// without a compositor. The table covers each decision; the drag scripts replay
++// the cases from the PR review against a small model of Hyprland's drag
++// handling (one target at a time: leave the old, enter the new; its motion
++// listener measures from the target's real position) and check what every
++// target receives.
++//
++//   make test-dnd-route        (or: g++ -std=c++2b -I. tests/canvas-dnd-route-test.cpp)
++#include "CanvasDndRoute.hpp"
++
++#include <cstdio>
++#include <map>
++#include <string>
++#include <vector>
++
++using namespace SpatialOverview::CanvasDnd;
++
++static int g_failures = 0;
++static void check(bool cond, const std::string& msg) {
++    std::printf("%s %s\n", cond ? "PASS" : "FAIL", msg.c_str());
++    if (!cond)
++        ++g_failures;
++}
++
++static void routeTable() {
++    const SPointerProbe DRAG{.dragActive = true, .buttonHeld = true, .pointerOnThisCanvas = true};
++    auto                with = [&](auto edit) {
++        auto p = DRAG;
++        edit(p);
++        return route(p);
++    };
++
++    check(with([](auto& p) { p.dragActive = false; }) == ERoute::NOT_DRAGGING, "no drag: the normal canvas pointer path");
++    check(with([](auto& p) { p.canvasWindowBelow = true; }) == ERoute::CANVAS_TARGET, "over a canvas window: the canvas picks the target");
++    check(with([](auto&) {}) == ERoute::CANVAS_EMPTY, "over empty canvas: no target");
++    check(with([](auto& p) { p.layerAbove = true; }) == ERoute::HYPRLAND, "over a panel: Hyprland");
++    check(with([](auto& p) { p.layerAbove = p.canvasWindowBelow = true; }) == ERoute::HYPRLAND, "a panel above a canvas window wins");
++    check(with([](auto& p) { p.pointerOnThisCanvas = false; p.canvasWindowBelow = true; }) == ERoute::HYPRLAND,
++          "another monitor / fullscreen (no canvas there): Hyprland");
++    check(with([](auto& p) { p.closing = true; p.canvasWindowBelow = true; }) == ERoute::HYPRLAND, "a closing canvas hands the drag to Hyprland");
++    check(with([](auto& p) { p.buttonHeld = false; p.canvasWindowBelow = true; }) == ERoute::DROPPED, "after the drop the canvas holds still");
++    check(with([](auto& p) { p.buttonHeld = false; p.pointerOnThisCanvas = false; }) == ERoute::HYPRLAND, "after the drop, other monitors stay Hyprland's");
++    check(holdBackHyprlandMotion(true, true), "Hyprland's motion is held back for the canvas-picked target");
++    check(!holdBackHyprlandMotion(true, false), "...but not once Hyprland has moved the target elsewhere");
++    check(!holdBackHyprlandMotion(false, false), "...nor when the canvas picked nothing");
++}
++
++// ---- drag model ---------------------------------------------------------
++
++enum class EWhere { CANVAS_WINDOW, EMPTY_CANVAS, PANEL, PANEL_OVER_WINDOW, OTHER_MONITOR_FULLSCREEN };
++
++struct SSpot {
++    EWhere      where;
++    std::string surface; // what is under the pointer ("" for nothing)
++};
++
++struct SEvent {
++    std::string kind; // enter, motion, leave, drop, cancelled
++    bool        wrongCoords = false;
++};
++
++class CModel {
++  public:
++    std::map<std::string, std::vector<SEvent>> got;
++    int                                        cancelled = 0;
++
++    void begin(const std::string& origin) {
++        m_active = m_held = true;
++        m_canvasPick.forget();
++        m_target = origin; // Hyprland enters the origin when the drag starts
++        send(m_target, {"enter"});
++    }
++
++    void move(const SSpot& s) {
++        const bool    ONCANVAS = s.where != EWhere::OTHER_MONITOR_FULLSCREEN;
++        SPointerProbe p{.dragActive          = m_active,
++                        .buttonHeld          = m_held,
++                        .pointerOnThisCanvas = ONCANVAS,
++                        .layerAbove          = s.where == EWhere::PANEL || s.where == EWhere::PANEL_OVER_WINDOW,
++                        .canvasWindowBelow   = s.where == EWhere::CANVAS_WINDOW || s.where == EWhere::PANEL_OVER_WINDOW};
++        const auto    R = route(p);
++
++        // 1. the canvas listener (registered first)
++        bool cancelEvent = true;
++        switch (R) {
++            case ERoute::NOT_DRAGGING:
++            case ERoute::HYPRLAND: cancelEvent = false; break;
++            case ERoute::DROPPED: break;
++            case ERoute::CANVAS_TARGET:
++                focus(s.surface);
++                m_canvasPick.pick(id(s.surface));
++                send(m_target, {"motion"});
++                break;
++            case ERoute::CANVAS_EMPTY:
++                m_canvasPick.forget();
++                focus("");
++                break;
++        }
++
++        // 2. Hyprland's drag-motion listener, same event: measures from the
++        // real position, which is wrong for a canvas-drawn window.
++        if (m_active && m_held && !m_target.empty() && !m_canvasPick.holdBack(id(m_target)))
++            send(m_target, {"motion", isCanvasWindow(m_target)});
++
++        // 3. Hyprland's own hit test, when the event was not cancelled.
++        // Over the canvas it would find windows at their real position, so
++        // only panels and other monitors are modelled here.
++        if (!cancelEvent && m_active && m_held)
++            focus(s.where == EWhere::PANEL_OVER_WINDOW ? std::string("panel") : s.surface);
++    }
++
++    void release() {
++        if (!m_active)
++            return;
++        m_held = false;
++        if (m_target.empty()) {
++            ++cancelled; // dropDrag without a target: abortDrag
++            end();
++            return;
++        }
++        send(m_target, {"drop"});
++        send(m_target, {"leave"});
++    }
++
++    void finish() { end(); } // the target calls wl_data_offer.finish
++    void escape() {          // abortDrag
++        if (!m_active)
++            return;
++        if (!m_target.empty())
++            send(m_target, {"leave"});
++        ++cancelled;
++        end();
++    }
++
++    bool active() const { return m_active; }
++
++  private:
++    bool        m_active = false, m_held = false;
++    std::string m_target;
++    SCanvasPick m_canvasPick;
++
++    static bool isCanvasWindow(const std::string& s) { return s == "source" || s == "canvas-target"; }
++
++    void        send(const std::string& surface, SEvent e) {
++        if (!surface.empty())
++            got[surface].push_back(e);
++    }
++    void focus(const std::string& surface) {
++        if (surface == m_target)
++            return;
++        send(m_target, {"leave"});
++        m_target = surface;
++        send(m_target, {"enter"});
++    }
++    void end() {
++        m_active = m_held = false;
++        m_target.clear();
++        m_canvasPick.forget();
++    }
++    // a stable identity per surface name, like a surface pointer
++    const void* id(const std::string& surface) {
++        return surface.empty() ? nullptr : &m_ids[surface];
++    }
++    std::map<std::string, char> m_ids;
++};
++
++static int count(const std::vector<SEvent>& v, const std::string& kind) {
++    int n = 0;
++    for (const auto& e : v)
++        n += e.kind == kind;
++    return n;
++}
++
++static bool anyWrong(const std::vector<SEvent>& v) {
++    for (const auto& e : v)
++        if (e.wrongCoords)
++            return true;
++    return false;
++}
++
++// enter, then motion, then leave, in that order, as many times as entered
++static bool wellFormed(const std::vector<SEvent>& v) {
++    bool inside = false;
++    for (const auto& e : v) {
++        if (e.kind == "enter") {
++            if (inside)
++                return false;
++            inside = true;
++        } else if (e.kind == "leave") {
++            if (!inside)
++                return false;
++            inside = false;
++        } else if (!inside)
++            return false;
++    }
++    return !inside;
++}
++
++static void dragScripts() {
++    const SSpot SOURCE{EWhere::CANVAS_WINDOW, "source"}, CANVAS{EWhere::CANVAS_WINDOW, "canvas-target"}, EMPTY{EWhere::EMPTY_CANVAS, ""},
++        PANEL{EWhere::PANEL, "panel"}, PANEL_OVER{EWhere::PANEL_OVER_WINDOW, "canvas-target"}, FULLSCREEN{EWhere::OTHER_MONITOR_FULLSCREEN, "fullscreen"};
++
++    {
++        CModel m;
++        m.begin("source");
++        for (const auto& s : {SOURCE, CANVAS, CANVAS, PANEL, PANEL, PANEL_OVER, CANVAS, FULLSCREEN, FULLSCREEN, FULLSCREEN})
++            m.move(s);
++        m.release();
++        m.finish();
++        for (const auto* t : {"source", "canvas-target", "panel", "fullscreen"})
++            check(wellFormed(m.got[t]), std::string("[tour] ") + t + ": enter / motion / leave in order");
++        check(count(m.got["canvas-target"], "motion") >= 3 && !anyWrong(m.got["canvas-target"]), "[tour] canvas window: motion, all in its drawn coordinates");
++        check(count(m.got["panel"], "enter") == 1 && count(m.got["panel"], "motion") >= 2, "[tour] panel above the canvas: entered, moved, kept over a window under it");
++        check(count(m.got["fullscreen"], "motion") >= 2, "[tour] fullscreen window on the other monitor gets motion (the v3 bug)");
++        check(count(m.got["fullscreen"], "drop") == 1 && m.cancelled == 0, "[tour] the drop lands on the fullscreen window");
++    }
++    {
++        CModel m;
++        m.begin("source");
++        m.move(CANVAS);
++        m.move(EMPTY);
++        m.release();
++        check(m.cancelled == 1 && !m.active(), "[empty] a drop on empty canvas cancels the drag");
++        check(wellFormed(m.got["canvas-target"]) && count(m.got["canvas-target"], "drop") == 0, "[empty] the window it passed got leave, no drop");
++    }
++    {
++        CModel m;
++        m.begin("source");
++        m.move(FULLSCREEN);
++        m.move(FULLSCREEN);
++        m.escape();
++        check(m.cancelled == 1 && !m.active() && wellFormed(m.got["fullscreen"]), "[escape] Escape over the fullscreen window cancels with a leave");
++        m.got.clear();
++        m.begin("source");
++        m.move(CANVAS);
++        m.move(FULLSCREEN);
++        m.move(FULLSCREEN);
++        m.release();
++        m.finish();
++        check(count(m.got["fullscreen"], "motion") >= 1 && count(m.got["fullscreen"], "drop") == 1, "[repeat] the next drag reaches the fullscreen window again");
++        check(!anyWrong(m.got["canvas-target"]) && wellFormed(m.got["canvas-target"]), "[repeat] and the canvas window again, no stale target");
++    }
++    {
++        CModel m;
++        m.begin("source");
++        m.move(CANVAS);
++        m.release(); // dropped on the canvas window, target not finished yet
++        const auto BEFORE = m.got;
++        m.move(PANEL_OVER);
++        m.move(EMPTY);
++        check(m.got["panel"].empty() && m.got["canvas-target"].size() == BEFORE.at("canvas-target").size(),
++              "[dropped] moving before the target finishes sends nothing new on the canvas");
++        m.finish();
++        m.begin("source");
++        m.move(PANEL);
++        m.release();
++        m.finish();
++        check(count(m.got["panel"], "drop") == 1, "[dropped] after finishing, the next drag drops on the panel");
++    }
++}
++
++int main() {
++    routeTable();
++    dragScripts();
++    std::printf(g_failures ? "%d FAILED\n" : "ALL PASSED\n", g_failures);
++    return g_failures ? 1 : 0;
++}
+diff --git a/tests/dnd-nested.py b/tests/dnd-nested.py
+new file mode 100644
+index 0000000..3ca2084
+--- /dev/null
++++ b/tests/dnd-nested.py
+@@ -0,0 +1,222 @@
++"""Drag and drop (wl_data_device) from a canvas window, two monitors. The
++canvas draws windows away from their real position, so it picks the drag
++target itself over its windows; everywhere else Hyprland's own drag handling
++must keep working, motion included. Checks, with a GTK source and targets
++that print what they get (tests/tools/dnd-app.py):
++- a canvas window: enter, motion in the coordinates it is drawn at, leave;
++- a top-layer panel above the canvas (a bar): enter, motion, leave;
++- a fullscreen window on the other monitor (its canvas steps aside): enter,
++  motion, drop;
++- a drop on empty canvas cancels the drag; the next drag works again;
++- the source going away mid-drag cancels cleanly; the compositor lives on;
++- after each drag the pointer reaches the windows again (no grab left).
++
++usage: tests/dnd-nested.py [PLUGIN.so]   (default .build/dev/spatialoverview.so)
++"""
++import json, os, signal, subprocess, sys, tempfile, time, importlib.util
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++spec = importlib.util.spec_from_file_location("nav", os.path.join(HERE, "navigator-nested.py"))
++nav = importlib.util.module_from_spec(spec); spec.loader.exec_module(nav)
++ROOT = os.path.dirname(HERE)
++subprocess.run(["make", "-s", "-C", ROOT, "test-tools"], check=True)
++
++tmp = tempfile.mkdtemp(prefix="dnd-")
++logs = {name: os.path.join(tmp, f"{name}.log") for name in ("source", "target", "panel", "fullscreen")}
++PANEL_H = 48
++n = nav.Nested(sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, ".build/dev/spatialoverview.so"), os.path.join(ROOT, ".build/shots-dnd"),
++               extra_lua='\nhl.monitor({ output = "WAYLAND-1", mode = "1280x720@60", position = "0x0", scale = 1 })\n'
++                         'hl.monitor({ output = "SECOND", mode = "1280x720@60", position = "1280x0", scale = 1 })\n')
++failures = []
++
++
++def check(cond, msg):
++    print(("PASS " if cond else "FAIL ") + msg, flush=True)
++    if not cond:
++        failures.append(msg)
++
++
++def lines(name, since=0):
++    if not os.path.exists(logs[name]):
++        return []
++    return open(logs[name]).read().splitlines()[since:]
++
++
++def mark():
++    return {name: len(lines(name)) for name in logs}
++
++
++def events(name, m, kind):
++    return [l.split() for l in lines(name, m[name]) if l.split()[0] == kind]
++
++
++def point(name, m, kind):
++    got = events(name, m, kind)
++    return (int(got[-1][-2]), int(got[-1][-1])) if got else None
++
++
++def near(p, q, tol=12):
++    return p is not None and q is not None and abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol
++
++
++def client(title):
++    return next((c for c in n.clients() if c["title"] == title), None)
++
++
++def app(name, title, extra=""):
++    pre = "LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so " if "--layer" in extra else ""
++    n.dispatch("hl.dsp.exec_cmd(" + json.dumps(f"sh -c '{pre}python3 {HERE}/tools/dnd-app.py {title} {extra} > {logs[name]}'") + ")")
++    for _ in range(100):
++        if "ready" in lines(name):
++            return
++        time.sleep(0.1)
++    raise RuntimeError(f"{title} did not start")
++
++
++def pointer(*cmds):
++    # One connection, so the button stays held between commands.
++    return subprocess.Popen([os.path.join(ROOT, ".build/vpointer"), "2560", "720", *map(str, cmds)], env=n.env())
++
++
++def path(a, b, steps=10, pause=30):
++    """Small moves from a to b, so each target gets several motion events."""
++    out = []
++    for i in range(1, steps + 1):
++        out += ["abs", round(a[0] + (b[0] - a[0]) * i / steps), round(a[1] + (b[1] - a[1]) * i / steps), "sleep", pause]
++    return out
++
++
++def start_drag(at):
++    # GTK starts a drag after a few pixels with the button held.
++    return ["abs", at[0], at[1], "sleep", 200, "down", "sleep", 150] + sum([["rel", 4, 3, "sleep", 30] for _ in range(6)], []) + ["sleep", 200]
++
++
++def hovered_by(p):
++    """Which app gets the pointer at p (no button held)."""
++    m = mark()
++    pointer("abs", p[0], p[1], "sleep", 60, "rel", 1, 0, "sleep", 60, "rel", -1, 0, "sleep", 200).wait(timeout=10)
++    return [name for name in ("source", "target") if events(name, m, "hover")]
++
++
++def find(name, guess):
++    if name in hovered_by(guess):
++        return guess
++    for y in range(PANEL_H + 40, 720, 60):
++        for x in range(40, 1280, 80):
++            if name in hovered_by((x, y)):
++                return (x, y)
++    return None
++
++
++try:
++    n.launch()
++    n.ctl("output", "create", "wayland", "SECOND")
++    time.sleep(0.8)
++    n.ctl("reload")
++    time.sleep(1.0)
++    print("monitors:", [(m["name"], m["x"], m["width"]) for m in json.loads(n.ctl("-j", "monitors"))])
++
++    app("panel", "dnd-panel", f"--size 1280x{PANEL_H} --layer WAYLAND-1")
++    n.dispatch('hl.dsp.focus({monitor="WAYLAND-1"})'); time.sleep(0.3)
++    app("target", "dnd-target")
++    app("source", "dnd-source")
++    n.dispatch('hl.dsp.focus({monitor="SECOND"})'); time.sleep(0.3)
++    app("fullscreen", "dnd-fullscreen", "--size 640x360 --fullscreen SECOND")
++    for _ in range(50):
++        c = client("dnd-fullscreen")
++        if c and c["fullscreen"] and c["at"][0] == 1280:
++            break
++        time.sleep(0.1)
++    time.sleep(1.0)
++    fs = client("dnd-fullscreen")
++    check(fs and fs["fullscreen"] != 0 and fs["at"][0] == 1280, f"the fullscreen target covers SECOND ({fs and fs['at']} {fs and fs['size']})")
++
++    n.dispatch('hl.plugin.spatialoverview.overview("toggle all")'); time.sleep(0.8)
++    n.keys("-k", "Escape"); time.sleep(0.3)
++    n.keys("-k", "Escape"); time.sleep(0.8)
++    n.dispatch('hl.dsp.focus({monitor="WAYLAND-1"})'); time.sleep(0.3)
++    n.dispatch('hl.plugin.spatialoverview.canvas("search dnd-source")'); time.sleep(0.4)
++    n.keys("-k", "Return"); time.sleep(1.2)
++    n.shot("0-landed")
++
++    src, tgt = client("dnd-source"), client("dnd-target")
++    print("  real: source", src["at"], src["size"], " target", tgt["at"], tgt["size"])
++    # Landing centers the source; at 100% the target is drawn relative to it.
++    src_at = find("source", (640, 360))
++    guess = (round(640 + tgt["at"][0] + tgt["size"][0] / 2 - src["at"][0] - src["size"][0] / 2),
++             round(360 + tgt["at"][1] + tgt["size"][1] / 2 - src["at"][1] - src["size"][1] / 2))
++    tgt_at = find("target", guess)
++    empty = next((p for p in ((40, 700), (1240, 700), (40, PANEL_H + 40), (1240, PANEL_H + 40)) if not hovered_by(p)), None)
++    print("  drawn: source", src_at, " target", tgt_at, "(guessed", guess, ")  empty canvas", empty)
++    check(src_at and tgt_at and empty, "found the source, the target and some empty canvas on screen")
++    if not (src_at and tgt_at and empty):
++        raise SystemExit
++    # Where the pointer hits the target, in its own (drawn) coordinates.
++    m = mark()
++    pointer("abs", tgt_at[0], tgt_at[1], "sleep", 60, "rel", 1, 0, "sleep", 60, "rel", -1, 0, "sleep", 200).wait(timeout=10)
++    tgt_local = point("target", m, "hover")
++    panel_at, fs_at = (tgt_at[0], PANEL_H // 2), (1920, 360)
++
++    # -- 1. one drag over everything, dropped on the fullscreen window
++    m = mark()
++    pointer(*start_drag(src_at), *path(src_at, tgt_at), "sleep", 300, *path(tgt_at, panel_at), "sleep", 300,
++            *path(panel_at, fs_at, 16), "sleep", 400, "up", "sleep", 800).wait(timeout=30)
++    time.sleep(0.5)
++    n.shot("1-dropped-fullscreen")
++    print("  target:", lines("target", m["target"])[:3], "...", len(events("target", m, "dnd-motion")), "motions")
++    print("  panel:", len(events("panel", m, "dnd-motion")), "motions, fullscreen:", lines("fullscreen", m["fullscreen"])[-3:])
++    check(events("source", m, "drag-begin"), "[drag] the drag started from the canvas window")
++    check(events("target", m, "dnd-enter") and len(events("target", m, "dnd-motion")) >= 3 and events("target", m, "dnd-leave"),
++          "[canvas window] enter, motion, leave")
++    motions = [(int(e[1]), int(e[2])) for e in events("target", m, "dnd-motion")]
++    w, h = tgt["size"]
++    check(tgt_local and any(near(p, tgt_local, 6) for p in motions) and all(0 <= x <= w and 0 <= y <= h for x, y in motions),
++          f"[canvas window] drag motion is in the coordinates it is drawn at (pointer {tgt_local}, motion {motions[:4]}...)")
++    check(events("panel", m, "dnd-enter") and len(events("panel", m, "dnd-motion")) >= 2 and events("panel", m, "dnd-leave"),
++          "[panel] a top-layer panel above the canvas gets enter, motion, leave")
++    check(near(point("panel", m, "dnd-motion"), (panel_at[0], panel_at[1]), 40), f"[panel] its motion is where the pointer is ({point('panel', m, 'dnd-motion')})")
++    check(events("fullscreen", m, "dnd-enter") and len(events("fullscreen", m, "dnd-motion")) >= 3,
++          "[fullscreen, other monitor] enter and motion (Hyprland's drag motion still runs)")
++    check(near(point("fullscreen", m, "dnd-motion"), (640, 360), 12), f"[fullscreen] its motion is where the pointer is ({point('fullscreen', m, 'dnd-motion')})")
++    check([d for d in events("fullscreen", m, "drop") if d[1] == "dnd-payload_dnd-source"], "[fullscreen] the drop lands there")
++    check(not events("source", m, "drag-cancel") and events("source", m, "drag-end"), "[drag] the source sees a completed drag")
++
++    # -- 2. dropped on empty canvas: cancelled
++    m = mark()
++    pointer(*start_drag(src_at), *path(src_at, tgt_at), "sleep", 200, *path(tgt_at, empty), "sleep", 300, "up", "sleep", 800).wait(timeout=30)
++    time.sleep(0.5)
++    check(events("source", m, "drag-cancel"), f"[cancel] a drop on empty canvas cancels the drag ({events('source', m, 'drag-cancel')})")
++    check(events("target", m, "dnd-leave") and not events("target", m, "drop"), "[cancel] the window it crossed got leave, no drop")
++
++    # -- 3. right after: a drag onto the canvas window, then the fullscreen one
++    m = mark()
++    pointer(*start_drag(src_at), *path(src_at, tgt_at), "sleep", 400, "up", "sleep", 800).wait(timeout=30)
++    time.sleep(0.5)
++    drop = events("target", m, "drop")
++    check(drop and near((int(drop[-1][2]), int(drop[-1][3])), tgt_local, 40), f"[repeat] the next drag drops on the canvas window where the pointer is ({drop})")
++    m = mark()
++    pointer(*start_drag(src_at), *path(src_at, fs_at, 16), "sleep", 400, "up", "sleep", 800).wait(timeout=30)
++    time.sleep(0.5)
++    check(len(events("fullscreen", m, "dnd-motion")) >= 3 and events("fullscreen", m, "drop"), "[repeat] and again on the fullscreen window, with motion")
++
++    # -- 4. the pointer is the apps' again
++    check("target" in hovered_by(tgt_at), "[after] the canvas window gets the pointer again (no grab left behind)")
++
++    # -- 5. the source goes away mid-drag
++    m = mark()
++    held = pointer(*start_drag(src_at), *path(src_at, fs_at, 16), "sleep", 1500, "up", "sleep", 500)
++    time.sleep(0.2 + 0.15 + 0.18 + 0.2 + 16 * 0.035 + 0.5)
++    pid = client("dnd-source")["pid"]
++    os.kill(pid, signal.SIGKILL)
++    held.wait(timeout=30)
++    time.sleep(0.5)
++    check(events("fullscreen", m, "dnd-enter") and events("fullscreen", m, "dnd-leave") and not events("fullscreen", m, "drop"),
++          "[source gone] the fullscreen window got leave, no drop")
++    check("target" in hovered_by(tgt_at), "[source gone] the pointer reaches the canvas again")
++    check(n.proc.poll() is None, "compositor alive")
++except SystemExit:
++    pass
++finally:
++    n.stop()
++print("ALL PASSED" if not failures else f"{len(failures)} FAILED")
++sys.exit(1 if failures else 0)
+diff --git a/tests/tools/dnd-app.py b/tests/tools/dnd-app.py
+new file mode 100644
+index 0000000..62ec4b4
+--- /dev/null
++++ b/tests/tools/dnd-app.py
+@@ -0,0 +1,99 @@
++"""A GTK4 window (or top-layer panel) for drag-and-drop tests. It is a drag
++source (drag anywhere: text "dnd-payload TITLE") and a drop target, and prints
++what wl_data_device and wl_pointer give it, in surface coordinates:
++
++  hover X Y            pointer motion (no drag)
++  dnd-enter X Y        a drag entered
++  dnd-motion X Y       drag motion
++  dnd-leave            the drag left (also after a drop)
++  drop TEXT X Y        dropped here
++  drag-begin / drag-end / drag-cancel REASON   (as the source)
++
++usage: dnd-app.py TITLE [--size WxH] [--fullscreen OUTPUT] [--layer OUTPUT]
++(--layer needs LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so)
++"""
++import argparse
++import gi
++
++gi.require_version("Gtk", "4.0")
++gi.require_version("Gdk", "4.0")
++from gi.repository import Gdk, Gio, GLib, GObject, Gtk
++
++ap = argparse.ArgumentParser()
++ap.add_argument("title")
++ap.add_argument("--size", default="360x240")
++ap.add_argument("--fullscreen")
++ap.add_argument("--layer")
++args = ap.parse_args()
++W, H = map(int, args.size.split("x"))
++
++
++def out(*parts):
++    print(" ".join(str(p) for p in parts), flush=True)
++
++
++def monitor_named(name):
++    monitors = Gdk.Display.get_default().get_monitors()
++    for i in range(monitors.get_n_items()):
++        if monitors.get_item(i).get_connector() == name:
++            return monitors.get_item(i)
++    return None
++
++
++def activate(app):
++    win = Gtk.ApplicationWindow(application=app, title=args.title)
++    area = Gtk.DrawingArea()
++    area.set_size_request(W, H)
++    area.set_draw_func(lambda _a, cr, w, h: (cr.set_source_rgb(0.2, 0.35, 0.6), cr.paint()))
++
++    hover = Gtk.EventControllerMotion()
++    hover.connect("motion", lambda _c, x, y: out("hover", round(x), round(y)))
++    area.add_controller(hover)
++
++    source = Gtk.DragSource(actions=Gdk.DragAction.COPY)
++    source.connect("prepare", lambda _s, _x, _y: Gdk.ContentProvider.new_for_value(f"dnd-payload {args.title}"))
++    source.connect("drag-begin", lambda _s, _d: out("drag-begin"))
++    source.connect("drag-end", lambda _s, _d, delete: out("drag-end"))
++    source.connect("drag-cancel", lambda _s, _d, reason: out("drag-cancel", reason.value_nick) or False)
++    area.add_controller(source)
++
++    motion = Gtk.DropControllerMotion()
++    motion.connect("enter", lambda _c, x, y: out("dnd-enter", round(x), round(y)))
++    motion.connect("motion", lambda _c, x, y: out("dnd-motion", round(x), round(y)))
++    motion.connect("leave", lambda _c: out("dnd-leave"))
++    area.add_controller(motion)
++
++    target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.COPY)
++
++    def dropped(_t, value, x, y):
++        out("drop", value.replace(" ", "_"), round(x), round(y))
++        return True
++
++    target.connect("drop", dropped)
++    area.add_controller(target)
++    win.set_child(area)
++
++    if args.layer:
++        gi.require_version("Gtk4LayerShell", "1.0")
++        from gi.repository import Gtk4LayerShell as LayerShell
++
++        LayerShell.init_for_window(win)
++        LayerShell.set_layer(win, LayerShell.Layer.TOP)
++        LayerShell.set_namespace(win, "dnd-test-panel")
++        for edge in (LayerShell.Edge.TOP, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
++            LayerShell.set_anchor(win, edge, True)
++        LayerShell.auto_exclusive_zone_enable(win)
++        if monitor := monitor_named(args.layer):
++            LayerShell.set_monitor(win, monitor)
++        area.set_size_request(100, H)
++    win.set_default_size(W, H)
++    win.present()
++    if args.fullscreen:
++        monitor = monitor_named(args.fullscreen)
++        GLib.timeout_add(300, lambda: (win.fullscreen_on_monitor(monitor) if monitor else win.fullscreen()) and False)
++    out("ready")
++
++
++app = Gtk.Application(application_id=f"dev.spatialoverview.dnd.{args.title.replace('-', '')}", flags=Gio.ApplicationFlags.NON_UNIQUE)
++app.connect("activate", activate)
++app.run(None)

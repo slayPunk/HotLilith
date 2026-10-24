@@ -1,0 +1,23 @@
+# Local experiments, session evidence and test outputs
+/work/
+/outputs/
+
+# Generated builds and metadata
+__pycache__/
+*.py[cod]
+*.o
+*.so
+*.so.next
+/build-version.json
+/source/.build/
+/source/.cache/
+
+# Local editor/environment files
+.env
+.env.*
+!.env.example
+.venv/
+.idea/
+.vscode/
+*.swp
+*.swo

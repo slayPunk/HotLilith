@@ -1,0 +1,11 @@
+[repository]
+name = "phantomat"
+authors = ["kaolti", "yayuuu", "Vaxry"]
+
+[spatialoverview]
+description = "Phantomat: a zoomable, infinite-canvas window manager for Hyprland."
+authors = ["kaolti", "yayuuu", "Vaxry"]
+output = "spatialoverview.so"
+build = [
+    "make all",
+]

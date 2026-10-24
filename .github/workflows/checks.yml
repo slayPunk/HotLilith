@@ -1,0 +1,36 @@
+name: Source checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: Compositor-independent checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install core test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y g++ make pkg-config binutils python3
+      - name: Check publication contents
+        run: python3 tools/check-repository.py
+      - name: Check Python sources
+        run: python3 -m compileall -q install.py preview.py demo-window.py tests tools source/tests
+      - name: Check shell entry points
+        run: bash -n build.sh tests/build-tools.sh
+      - name: Test installer and build ABI handling
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Test mechanics and drag routing models
+        run: make -C source test-physics test-dnd-route
+      - name: Check whitespace
+        run: git diff --check

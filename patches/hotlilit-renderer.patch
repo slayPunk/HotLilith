@@ -1,0 +1,2860 @@
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -1,3 +1,5 @@
++> This document is retained from the renderer upstream. HotLilith changes follow the [root contributing guide](../CONTRIBUTING.md).
++
+ # Contributing
+ 
+ Issues and pull requests are welcome.
+--- /dev/null
++++ b/CanvasFeatures.inc
+@@ -0,0 +1,306 @@
++// Hotlilit mechanics. Included by scrollOverview.cpp to share its canvas
++// eligibility and native-layout guards, without exposing compositor internals.
++double CScrollOverview::mechanicsTime() {
++    return std::chrono::duration<double>(Time::steadyNow().time_since_epoch()).count();
++}
++
++void CScrollOverview::stopCanvasMotion() {
++    const bool moving = panCoast.active || windowCoast.active;
++    panCoast.stop();
++    windowCoast.stop();
++    coastingWindow.reset();
++    if (moving) {
++        noteCanvasLayoutChanged();
++        damage();
++    }
++}
++
++void CScrollOverview::beginMotionSample(bool pan) {
++    stopCanvasMotion();
++    magnetX.reset();
++    magnetY.reset();
++    auto& samples = pan ? panSamples : windowSamples;
++    samples.clear();
++    if (pan && viewOffset)
++        samples.add(mechanicsTime(), {viewOffset->value().x, viewOffset->value().y});
++}
++
++void CScrollOverview::sampleWindowMotion() {
++    if (!isCanvasDesktop() || !dragActiveWindow)
++        return;
++    const auto w = dragActiveWindow.lock();
++    const auto i = dragWorkspaceIndex(w);
++    if (i >= images.size())
++        return;
++    const auto pos = overviewPointToGlobal(i, lastMousePosLocal - dragGrabOffsetLocal);
++    windowSamples.add(mechanicsTime(), {pos.x, pos.y});
++}
++
++void CScrollOverview::releaseWindowMotion(PHLWINDOW w) {
++    if (!isCanvasDesktop() || !Desktop::View::validMapped(w) || !w->m_isFloating || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:inertia_enabled"))
++        return;
++    auto v = windowSamples.release(mechanicsTime(), canvasZoom());
++    if (magnetX)
++        v.x = 0;
++    if (magnetY)
++        v.y = 0;
++    coastingWindow = w;
++    windowCoast.start(v, mechanicsTime());
++    magnetX.reset();
++    magnetY.reset();
++    requestInputFrame();
++}
++
++CBox CScrollOverview::magnetWindowBox(const CBox& world, PHLWINDOW window, bool resize) const {
++    if (!isCanvasDesktop() || !window || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:magnet_enabled"))
++        return world;
++    const auto                  viewport = currentCanvasViewportWorld();
++    std::vector<Hotlilit::Rect> neighbours;
++    for (const auto& w : Desktop::windowState()->windows()) {
++        if (w == window || !shouldShowOverviewWindow(w) || w->m_pinned || !w->layoutTarget() || !g_canvasNativeLayout.contains(w->m_stableID))
++            continue;
++        const auto b = w->layoutTarget()->position();
++        neighbours.push_back({b.x, b.y, b.w, b.h});
++    }
++    const bool left = resize && (resizeCorner == Layout::CORNER_TOPLEFT || resizeCorner == Layout::CORNER_BOTTOMLEFT);
++    const bool top  = resize && (resizeCorner == Layout::CORNER_TOPLEFT || resizeCorner == Layout::CORNER_TOPRIGHT);
++    const auto result =
++        Hotlilit::magnet({world.x, world.y, world.w, world.h}, neighbours, {viewport.x, viewport.y, viewport.w, viewport.h}, canvasZoom(),
++                         ScrollOverview::Config::getValue<int>("plugin:spatialoverview:canvas:magnet_gap"),
++                         ScrollOverview::Config::getValue<int>("plugin:spatialoverview:canvas:magnet_distance"), magnetX, magnetY, left, resize && !left, top, resize && !top);
++    CBox box{result.box.x, result.box.y, result.box.w, result.box.h};
++    if (resize && window->layoutTarget()) {
++        auto       size   = box.size();
++        const auto target = window->layoutTarget();
++        const auto min    = target->minSize().value_or(Vector2D{1, 1});
++        const auto max    = target->maxSize().value_or(Vector2D{16384, 16384});
++        size.x            = std::clamp(size.x, std::max(1.0, min.x), max.x > 0 ? std::max(min.x, max.x) : 16384.0);
++        size.y            = std::clamp(size.y, std::max(1.0, min.y), max.y > 0 ? std::max(min.y, max.y) : 16384.0);
++        // An app's size constraints take priority over magnets.
++        if (size != box.size()) {
++            magnetX.reset();
++            magnetY.reset();
++            return world;
++        }
++    }
++    magnetX = result.x;
++    magnetY = result.y;
++    return box;
++}
++
++CBox CScrollOverview::magnetLocalBox(const CBox& local, PHLWINDOW window, bool resize) const {
++    const auto monitor = pMonitor.lock();
++    if (!isCanvasDesktop() || !monitor)
++        return local;
++    auto screen = local;
++    screen.scale(1.F / std::max(monitor->m_scale, .01F));
++    screen.translate(monitor->m_position);
++    const auto world = canvasScreenToWorld(screen);
++    if (!world)
++        return local;
++    auto result = canvasWorldToScreen(magnetWindowBox(*world, window, resize));
++    result.translate(-monitor->m_position);
++    result.scale(monitor->m_scale);
++    return result;
++}
++
++void CScrollOverview::advanceCanvasMotion() {
++    if (!isCanvasDesktop() || closing) {
++        stopCanvasMotion();
++        return;
++    }
++    const double now = mechanicsTime();
++    if (pendingRegions.empty() && (regionArmed || spawnRegion) && now > regionDeadline)
++        cancelSpawnRegion();
++    const bool wasMoving = panCoast.active || windowCoast.active;
++    if (panCoast.active) {
++        const auto d = panCoast.step(now, canvasZoom());
++        viewOffset->setValueAndWarp(viewOffset->value() + Vector2D{d.x, d.y});
++    }
++    if (windowCoast.active) {
++        const auto w = coastingWindow.lock();
++        if (!shouldShowOverviewWindow(w) || !w->m_isFloating || !w->layoutTarget() || !g_canvasNativeLayout.contains(w->m_stableID) || Fullscreen::controller()->isFullscreen(w))
++            windowCoast.stop();
++        else {
++            const auto d   = windowCoast.step(now, canvasZoom());
++            auto       box = w->layoutTarget()->position();
++            box.translate({d.x, d.y});
++            box = magnetWindowBox(box, w);
++            if (magnetX)
++                windowCoast.velocity.x = 0;
++            if (magnetY)
++                windowCoast.velocity.y = 0;
++            if (windowCoast.velocity.length() * canvasZoom() < 20)
++                windowCoast.stop();
++            box.x = std::clamp(box.x, -1e6, 1e6);
++            box.y = std::clamp(box.y, -1e6, 1e6);
++            w->layoutTarget()->damageEntire();
++            w->layoutTarget()->setPositionGlobal(box);
++            w->layoutTarget()->warpPositionSize();
++            w->layoutTarget()->damageEntire();
++        }
++    }
++    if (wasMoving) {
++        markBlurDirty();
++        requestInputFrame();
++        damage();
++        if (!panCoast.active && !windowCoast.active) {
++            magnetX.reset();
++            magnetY.reset();
++            noteCanvasLayoutChanged();
++        }
++    }
++}
++
++void CScrollOverview::resetSpawnRegion() {
++    if (!regionArmed && !spawnRegion)
++        return;
++    if (regionDrawing)
++        navigatorSwallowedButtons.emplace(ScrollOverview::Config::getLeftHanded() ? BTN_RIGHT : BTN_LEFT);
++    regionArmed   = false;
++    regionDrawing = false;
++    spawnRegion.reset();
++    if (g_pointerGrabOverview == this)
++        g_pointerGrabOverview = nullptr;
++    setCanvasCursor(navigatorOwnsPointer() ? "left_ptr" : "");
++    damage();
++}
++
++bool CScrollOverview::handleRegionButton(uint32_t button, uint32_t state) {
++    if (!regionArmed)
++        return false;
++    const uint32_t main = ScrollOverview::Config::getLeftHanded() ? BTN_RIGHT : BTN_LEFT;
++    if (button != main)
++        return true; // Consume the complete gesture, including releases.
++    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
++        const auto monitor = pMonitor.lock();
++        if (!monitor)
++            return true;
++        const auto world = canvasScreenToWorld(CBox{monitor->m_position + lastMousePosLocal / monitor->m_scale, {1, 1}});
++        if (!world)
++            return true;
++        regionStart           = world->pos();
++        regionDrawing         = true;
++        spawnRegion           = CBox{regionStart, {1, 1}};
++        g_pointerGrabOverview = this;
++        g_pSeatManager->setPointerFocus(nullptr, {});
++    } else if (regionDrawing) {
++        updateSpawnRegion();
++        regionDrawing = false;
++        if (!spawnRegion || spawnRegion->w < 80 || spawnRegion->h < 60) {
++            spawnRegion.reset(); // Keep armed so a misclick can be retried.
++        } else {
++            regionArmed    = false;
++            regionDeadline = mechanicsTime() + 60;
++            setCanvasCursor(navigatorOwnsPointer() ? "left_ptr" : "");
++            if (!pendingRegions.empty())
++                finishPendingRegion(false);
++        }
++    }
++    damage();
++    return true;
++}
++
++void CScrollOverview::updateSpawnRegion() {
++    const auto monitor = pMonitor.lock();
++    if (!regionDrawing || !monitor)
++        return;
++    const auto world = canvasScreenToWorld(CBox{monitor->m_position + lastMousePosLocal / monitor->m_scale, {1, 1}});
++    if (!world)
++        return;
++    const auto p = world->pos();
++    spawnRegion  = CBox{std::min(p.x, regionStart.x), std::min(p.y, regionStart.y), std::abs(p.x - regionStart.x), std::abs(p.y - regionStart.y)};
++    damage();
++}
++
++bool CScrollOverview::applySpawnRegion(PHLWINDOW window) {
++    if (regionArmed || !spawnRegion || mechanicsTime() > regionDeadline || !shouldShowOverviewWindow(window) || !g_canvasNativeLayout.contains(window->m_stableID) ||
++        !window->layoutTarget())
++        return false;
++    auto       box    = *spawnRegion;
++    const auto target = window->layoutTarget();
++    const auto min    = target->minSize().value_or(Vector2D{1, 1});
++    const auto max    = target->maxSize().value_or(Vector2D{16384, 16384});
++    box.w             = std::clamp(box.w, std::max(1.0, min.x), max.x > 0 ? std::max(min.x, max.x) : 16384.0);
++    box.h             = std::clamp(box.h, std::max(1.0, min.y), max.y > 0 ? std::max(min.y, max.y) : 16384.0);
++    target->rememberFloatingSize(box.size());
++    target->setPositionGlobal(box);
++    target->warpPositionSize();
++    target->damageEntire();
++    resetSpawnRegion();
++    noteCanvasLayoutChanged();
++    return true;
++}
++
++void CScrollOverview::renderCanvasMechanics(PHLMONITOR monitor) {
++    if (!monitor)
++        return;
++    auto local = [&](CBox world) {
++        auto b = canvasWorldToScreen(world);
++        b.translate(-monitor->m_position);
++        b.scale(monitor->m_scale);
++        return b;
++    };
++    const auto gradient = ScrollOverview::Config::getCanvasAccent();
++    auto accent = gradient.m_colors.empty() ? Colors::WHITE : gradient.m_colors.front();
++    if (spawnRegion) {
++        const auto                  b = local(*spawnRegion);
++        CRectPassElement::SRectData fill;
++        fill.box   = b;
++        fill.color = accent;
++        fill.color.a *= .12F;
++        g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(fill));
++        CBorderPassElement::SBorderData border;
++        border.box        = b;
++        border.grad1      = gradient;
++        border.borderSize = std::max(1, sc<int>(std::round(ScrollOverview::Config::getValue<int>("general:border_size") * monitor->m_scale)));
++        g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(border));
++    }
++    if (!ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:magnet_guides") || (!dragActiveWindow && !resizeActiveWindow && !windowCoast.active))
++        return;
++    const auto viewport = currentCanvasViewportWorld();
++    for (int axis = 0; axis < 2; ++axis) {
++        const auto guide = axis == 0 ? magnetX : magnetY;
++        if (!guide)
++            continue;
++        CRectPassElement::SRectData line;
++        line.box   = local(axis == 0 ? CBox{*guide, viewport.y, 1.0 / canvasZoom(), viewport.h} : CBox{viewport.x, *guide, viewport.w, 1.0 / canvasZoom()});
++        line.color = accent;
++        g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(line));
++    }
++}
++
++void CScrollOverview::renderDoubleBorder(PHLMONITOR monitor, PHLWINDOW window, const CBox& box, float zoom) {
++    if (!isCanvasDesktop() || !monitor || !window || box.empty() || window->m_pinned || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:double_border"))
++        return;
++    if (window->getRealBorderSize() <= 0 || !window->m_ruleApplicator->decorate().valueOrDefault())
++        return;
++    const auto gradient = window->m_realBorderColor;
++    const int width = std::max(1, sc<int>(std::round(monitor->m_scale * zoom * window->getRealBorderSize())));
++    const int rounding = std::max(0, sc<int>(std::round(window->rounding() * monitor->m_scale * zoom)));
++    CBorderPassElement::SBorderData outer;
++    outer.box = box;
++    outer.box.expand(width);
++    outer.grad1      = gradient;
++    outer.borderSize = width;
++    outer.round      = rounding > 0 ? rounding + width : 0;
++    outer.outerRound = rounding > 0 ? rounding + 2 * width : 0;
++    outer.roundingPower = window->roundingPower();
++    outer.a          = .45F;
++    outer.window     = window;
++    g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(outer));
++    CBorderPassElement::SBorderData inner;
++    inner.box        = box;
++    inner.grad1      = gradient;
++    inner.borderSize = width;
++    inner.round      = rounding;
++    inner.outerRound = rounding > 0 ? rounding + width : 0;
++    inner.roundingPower = window->roundingPower();
++    inner.window     = window;
++    g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(inner));
++}
++
++std::string CScrollOverview::mechanicsStateJson() const {
++    return std::format("{{\"pan_inertia\":{},\"window_inertia\":{},\"region_armed\":{},\"pending_windows\":{},\"captured_pointer\":{},\"region\":{}}}", panCoast.active, windowCoast.active, regionArmed,
++                       pendingRegions.size(), g_pInputManager->isConstrained() || bool(g_canvasManualCapture.lock()), spawnRegion ? std::format("[{:.1f},{:.1f},{:.1f},{:.1f}]", spawnRegion->x, spawnRegion->y, spawnRegion->w, spawnRegion->h) : "null");
++}
+--- /dev/null
++++ b/CanvasInput.inc
+@@ -0,0 +1,144 @@
++void canvasRememberPointerPosition(const Vector2D&);
++
++// The native input path already sends relative motion before mouse.move.
++// Keep those deltas in device units: zoom must not change game sensitivity.
++// Only the cursor lock/confinement and absolute surface position are projected.
++bool CScrollOverview::handleCanvasPointerConstraint() {
++    if (!isCanvasDesktop() || closing || sessionLocked() || canvasCompositorDndActive() || regionArmed || dragPendingPrimary || dragActiveWindow || resizePointerDown ||
++        resizeActiveWindow || scrollingPanPointerDown || spacePanHeld || (g_pInputManager->getModsFromAllKBs() & HL_MODIFIER_META))
++        return false;
++    const auto window = Desktop::focusState()->window();
++    if (!shouldShowOverviewWindow(window) || window->m_pinned || !canvasDrawsWindow(window))
++        return false;
++    const auto surface    = Desktop::focusState()->surface();
++    const auto owner      = Desktop::View::CWLSurface::fromResource(surface);
++    if (!owner)
++        return false;
++    const auto constraint = owner ? owner->constraint() : nullptr;
++    const bool manual     = g_canvasManualCapture.lock() == window;
++    if ((!constraint || !constraint->isActive()) && !manual)
++        return false;
++    if (g_canvasCaptureBlocked.contains(window->m_stableID)) {
++        if (constraint)
++            constraint->deactivate();
++        return false;
++    }
++    const auto native  = owner->getSurfaceBoxGlobal();
++    const auto monitor = pMonitor.lock();
++    if (!native || !monitor)
++        return false;
++    const auto drawn   = canvasWorldToScreen(*native);
++    const auto visible = drawn.intersection(monitor->logicalBox());
++    if (visible.empty())
++        return false;
++    Vector2D   position = g_pInputManager->getMouseCoordsInternal();
++    const bool locked   = manual || constraint->isLocked();
++    if (locked) {
++        if (!manual && constraint->m_hintSet) {
++            const auto hint = constraint->logicPositionHint();
++            position        = canvasWorldToScreen(CBox{hint, {1, 1}}).pos();
++        } else
++            position = drawn.middle();
++        position = visible.closestPoint(position);
++    } else {
++        auto region = constraint->logicConstraintRegion();
++        region.translate(-native->pos()).scale(canvasZoom()).translate(drawn.pos());
++        region.intersect(visible.x, visible.y, visible.w, visible.h);
++        if (region.empty())
++            return false;
++        position = region.closestPoint(position);
++    }
++    const auto  local    = (position - drawn.pos()) / std::max(.01F, canvasZoom()) * window->m_X11SurfaceScaledBy;
++    static bool handling = false;
++    if (handling)
++        return true;
++    handling   = true;
++    auto reset = Hyprutils::Utils::CScopeGuard([] { handling = false; });
++    g_pSeatManager->setPointerFocus(surface, local);
++    Pointer::pointerController()->warpTo(position, true);
++    // mouseMoveUnified skips equal floored positions before its event. Its
++    // native bookkeeping is bypassed when this handler cancels that event.
++    // Keep it in sync so a large delta reaching (0,0) cannot skip the lock.
++    canvasRememberPointerPosition(position);
++    if (!locked)
++        g_pSeatManager->sendPointerMotion(Time::millis(Time::steadyNow()), local);
++    g_pSeatManager->sendPointerFrame();
++    canvasForwardedPointerWindow  = window;
++    canvasForwardedPointerSurface = surface;
++    lastMousePosLocal             = (position - monitor->m_position) * monitor->m_scale;
++    requestInputFrame();
++    return true;
++}
++
++bool CScrollOverview::suppressCanvasRelativeMotion() const {
++    if (!isCanvasDesktop() || closing)
++        return false;
++    return regionArmed || dragPendingPrimary || dragActiveWindow || resizePointerDown || resizeActiveWindow || scrollingPanPointerDown || spacePanHeld ||
++        (g_pInputManager->getModsFromAllKBs() & HL_MODIFIER_META);
++}
++
++bool canvasSuppressRelativeMotion() {
++    if (sessionLocked())
++        return false;
++    for (const auto& overview : scrollOverviews()) {
++        const auto* canvas = canvasOf(overview);
++        if (canvas && canvas->suppressCanvasRelativeMotion())
++            return true;
++    }
++    const auto focused = g_pSeatManager->m_state.pointerFocus.lock();
++    const auto surface = Desktop::View::CWLSurface::fromResource(focused);
++    const auto window  = surface ? Desktop::View::CWindow::fromView(surface->view()) : nullptr;
++    return window && g_canvasCaptureBlocked.contains(window->m_stableID);
++}
++
++bool canvasReleasePointerCapture() {
++    bool released = false;
++    if (const auto window = g_canvasManualCapture.lock()) {
++        g_canvasCaptureBlocked.insert(window->m_stableID);
++        released = true;
++    }
++    g_canvasManualCapture.reset();
++    for (const auto& ref : g_pInputManager->m_constraints) {
++        const auto c      = ref.lock();
++        const auto owner  = c ? c->owner() : nullptr;
++        const auto window = owner ? Desktop::View::CWindow::fromView(owner->view()) : nullptr;
++        if (!c || !window || (!g_canvasNativeLayout.contains(window->m_stableID) && !canvasFullscreenWindow(window)))
++            continue;
++        g_canvasCaptureBlocked.insert(window->m_stableID);
++        // deactivate() may remove a one-shot from m_constraints: deferred below.
++        released = true;
++    }
++    const auto constraints = g_pInputManager->m_constraints;
++    for (const auto& ref : constraints) {
++        const auto c      = ref.lock();
++        const auto owner  = c ? c->owner() : nullptr;
++        const auto window = owner ? Desktop::View::CWindow::fromView(owner->view()) : nullptr;
++        if (c && window && g_canvasCaptureBlocked.contains(window->m_stableID))
++            c->deactivate();
++    }
++    if (released) {
++        g_canvasCursorShape = "left_ptr";
++        Pointer::Cursor::overrideController->setOverride("left_ptr", Pointer::Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
++        g_pSeatManager->setPointerFocus(nullptr, {});
++    }
++    return released;
++}
++
++bool canvasCapturePointer() {
++    const auto window = Desktop::focusState()->window();
++    if (!window)
++        return false;
++    if (g_canvasManualCapture.lock() == window)
++        return canvasReleasePointerCapture();
++    for (const auto& overview : scrollOverviews()) {
++        const auto* canvas = canvasOf(overview);
++        if (!canvas || !canvas->canvasDrawsWindow(window))
++            continue;
++        g_canvasManualCapture = window;
++        g_canvasCaptureBlocked.erase(window->m_stableID);
++        Pointer::Cursor::overrideController->unsetOverride(Pointer::Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
++        g_canvasCursorShape.clear();
++        return true;
++    }
++    return false;
++}
+--- /dev/null
++++ b/CanvasPhysics.hpp
+@@ -0,0 +1,190 @@
++#pragma once
++
++// Canvas mechanics in world coordinates. Thresholds are expressed in screen
++// pixels so a zoomed-out desktop has the same grip and release behaviour.
++#include <algorithm>
++#include <cmath>
++#include <deque>
++#include <optional>
++#include <vector>
++
++namespace Hotlilit {
++    struct Point {
++        double x = 0, y = 0;
++        Point  operator+(Point p) const {
++            return {x + p.x, y + p.y};
++        }
++        Point operator-(Point p) const {
++            return {x - p.x, y - p.y};
++        }
++        Point operator*(double s) const {
++            return {x * s, y * s};
++        }
++        double length() const {
++            return std::hypot(x, y);
++        }
++    };
++    struct Rect {
++        double x, y, w, h;
++    };
++
++    class MotionSamples {
++        struct Sample {
++            double time;
++            Point  position;
++        };
++        std::deque<Sample> samples;
++
++      public:
++        void clear() {
++            samples.clear();
++        }
++        void add(double time, Point p) {
++            if (!std::isfinite(time) || !std::isfinite(p.x) || !std::isfinite(p.y))
++                return;
++            if (!samples.empty() && time <= samples.back().time)
++                return;
++            samples.push_back({time, p});
++            while (samples.size() > 2 && time - samples.front().time > .10)
++                samples.pop_front();
++            while (samples.size() > 32)
++                samples.pop_front();
++        }
++        Point release(double now, double zoom, double gain = .6) const {
++            if (samples.size() < 2 || now - samples.back().time > .10)
++                return {};
++            const auto&  first = samples.front();
++            const auto&  last  = samples.back();
++            const double dt    = last.time - first.time;
++            if (dt < .008 || dt > .20)
++                return {};
++            auto v             = (last.position - first.position) * (1.0 / dt);
++            zoom               = std::clamp(zoom, .01, 10.0);
++            const double speed = v.length() * zoom;
++            if (speed < 150)
++                return {};
++            v = v * gain;
++            if (v.length() * zoom > 2400)
++                v = v * (2400 / (v.length() * zoom));
++            return v;
++        }
++    };
++
++    struct Coast {
++        Point  velocity;
++        double lastTime = 0;
++        bool   active   = false;
++        void   stop() {
++            active   = false;
++            velocity = {};
++        }
++        void start(Point v, double now) {
++            velocity = v;
++            lastTime = now;
++            active   = v.length() > 0;
++        }
++        Point step(double now, double zoom, double tau = .4) {
++            if (!active)
++                return {};
++            const double dt = now - lastTime;
++            lastTime        = now;
++            // Suspend/resume or a stalled compositor must not fling a window away.
++            if (dt <= 0 || dt > .25 || !std::isfinite(dt)) {
++                stop();
++                return {};
++            }
++            tau                = std::clamp(tau, .05, 2.0);
++            const double decay = std::exp(-dt / tau);
++            const auto   delta = velocity * (tau * (1 - decay));
++            velocity           = velocity * decay;
++            if (velocity.length() * zoom < 20)
++                stop();
++            return delta;
++        }
++    };
++
++    struct MagnetResult {
++        Rect                  box;
++        std::optional<double> x, y; // guide coordinate in world space
++    };
++
++    // Match adjacent or aligned edges only when rectangles overlap on the other
++    // axis. Distant windows cannot pull a window across empty canvas. Existing
++    // locks get a wider release threshold, preventing jitter at the boundary.
++    inline MagnetResult magnet(Rect moving, const std::vector<Rect>& neighbours, Rect viewport, double zoom, double gap, double radius, std::optional<double> lockX = {},
++                               std::optional<double> lockY = {}, bool resizeLeft = false, bool resizeRight = false, bool resizeTop = false, bool resizeBottom = false) {
++        const bool            resizing  = resizeLeft || resizeRight || resizeTop || resizeBottom;
++        const double          threshold = radius / std::clamp(zoom, .01, 10.0);
++        double                dx = threshold + 1, dy = threshold + 1;
++        std::optional<double> gx, gy;
++        bool                  heldX = false, heldY = false;
++        auto                  considerX = [&](double candidate, double edge) {
++            const double d    = candidate - edge;
++            const bool   held = lockX && std::abs(candidate - *lockX) < .01;
++            if (std::abs(d) <= threshold * (held ? 1.6 : 1.0) && ((held && !heldX) || (held == heldX && std::abs(d) < std::abs(dx)))) {
++                dx    = d;
++                gx    = candidate;
++                heldX = held;
++            }
++        };
++        auto considerY = [&](double candidate, double edge) {
++            const double d    = candidate - edge;
++            const bool   held = lockY && std::abs(candidate - *lockY) < .01;
++            if (std::abs(d) <= threshold * (held ? 1.6 : 1.0) && ((held && !heldY) || (held == heldY && std::abs(d) < std::abs(dy)))) {
++                dy    = d;
++                gy    = candidate;
++                heldY = held;
++            }
++        };
++        const double left = moving.x, right = left + moving.w, top = moving.y, bottom = top + moving.h;
++        for (const auto& r : neighbours) {
++            if (bottom >= r.y - threshold && top <= r.y + r.h + threshold) {
++                if (!resizing || resizeLeft) {
++                    considerX(r.x + r.w + gap, left);
++                    considerX(r.x, left);
++                }
++                if (!resizing || resizeRight) {
++                    considerX(r.x - gap, right);
++                    considerX(r.x + r.w, right);
++                }
++            }
++            if (right >= r.x - threshold && left <= r.x + r.w + threshold) {
++                if (!resizing || resizeTop) {
++                    considerY(r.y + r.h + gap, top);
++                    considerY(r.y, top);
++                }
++                if (!resizing || resizeBottom) {
++                    considerY(r.y - gap, bottom);
++                    considerY(r.y + r.h, bottom);
++                }
++            }
++        }
++        if (!resizing || resizeLeft)
++            considerX(viewport.x, left);
++        if (!resizing || resizeRight)
++            considerX(viewport.x + viewport.w, right);
++        if (!resizing || resizeTop)
++            considerY(viewport.y, top);
++        if (!resizing || resizeBottom)
++            considerY(viewport.y + viewport.h, bottom);
++        if (gx) {
++            if (!resizing)
++                moving.x += dx;
++            else if (resizeLeft) {
++                moving.x += dx;
++                moving.w -= dx;
++            } else
++                moving.w += dx;
++        }
++        if (gy) {
++            if (!resizing)
++                moving.y += dy;
++            else if (resizeTop) {
++                moving.y += dy;
++                moving.h -= dy;
++            } else
++                moving.h += dy;
++        }
++        return {moving, gx, gy};
++    }
++}
+--- /dev/null
++++ b/CanvasPlacement.inc
+@@ -0,0 +1,163 @@
++// New toplevels wait for a canvas region; dialogs follow their parent.
++PHLWINDOW CScrollOverview::canvasDialogParent(PHLWINDOW window) const {
++    if (!window)
++        return {};
++    for (const auto& candidate : Desktop::windowState()->windows()) {
++        if (candidate == window || (!shouldShowOverviewWindow(candidate) && !g_canvasPendingWindows.contains(candidate->m_stableID)))
++            continue;
++        if (window->m_isX11 && window->m_xwaylandSurface && candidate->m_xwaylandSurface && window->m_xwaylandSurface->m_parent == candidate->m_xwaylandSurface)
++            return candidate;
++        if (!window->m_isX11 && window->m_xdgSurface && window->m_xdgSurface->m_toplevel && candidate->m_xdgSurface &&
++            window->m_xdgSurface->m_toplevel->m_parent == candidate->m_xdgSurface->m_toplevel)
++            return candidate;
++    }
++    return {};
++}
++
++bool CScrollOverview::queueCanvasWindow(PHLWINDOW window) {
++    if (!isCanvasDesktop() || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:spawn_on_open") || !shouldShowOverviewWindow(window) || window->m_pinned ||
++        canvasCompositorDndActive())
++        return false;
++    const auto parent = canvasDialogParent(window);
++    if (!manageCanvasWindow(window, false) || !window->layoutTarget())
++        return false;
++    if (parent && parent->layoutTarget()) {
++        if (g_canvasPendingWindows.contains(parent->m_stableID)) {
++            g_canvasPendingWindows.insert(window->m_stableID);
++            pendingDialogs.emplace_back(window, parent);
++            return true;
++        }
++        placeCanvasDialog(window, parent);
++        noteCanvasLayoutChanged();
++        return true;
++    }
++    if (Fullscreen::controller()->isFullscreen(window))
++        Fullscreen::controller()->setFullscreenMode(window, Fullscreen::FSMODE_NONE, Fullscreen::FSMODE_NONE);
++    // A region deliberately drawn before launching also satisfies placement.
++    if (!regionArmed && spawnRegion && applySpawnRegion(window))
++        return true;
++    g_canvasPendingWindows.insert(window->m_stableID);
++    pendingRegions.push_back(window);
++    stopCanvasMotion();
++    if (pendingRegions.size() == 1)
++        startNextPendingRegion();
++    return true;
++}
++
++void CScrollOverview::placeCanvasDialog(PHLWINDOW window, PHLWINDOW parent) {
++    if (!window || !window->layoutTarget() || !parent || !parent->layoutTarget())
++        return;
++    auto       box    = window->layoutTarget()->position();
++    const auto centre = parent->layoutTarget()->position().middle();
++    box.x             = centre.x - box.w * .5;
++    box.y             = centre.y - box.h * .5;
++    window->layoutTarget()->setPositionGlobal(box);
++    window->layoutTarget()->warpPositionSize();
++}
++
++void CScrollOverview::revealPendingDialogs(PHLWINDOW parent) {
++    std::vector<PHLWINDOW> children;
++    for (const auto& [child, owner] : pendingDialogs)
++        if (owner.lock() == parent)
++            if (const auto window = child.lock())
++                children.push_back(window);
++    std::erase_if(pendingDialogs, [&](const auto& item) { return !item.first || item.second.lock() == parent; });
++    for (const auto& window : children) {
++        g_canvasPendingWindows.erase(window->m_stableID);
++        if (!Desktop::View::validMapped(window))
++            continue;
++        placeCanvasDialog(window, parent);
++        canvasAdoptFocus(window);
++        Desktop::focusState()->fullWindowFocus(window, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
++        ensureCanvasKeyboardFocus(window);
++        revealPendingDialogs(window);
++    }
++}
++
++void CScrollOverview::startNextPendingRegion() {
++    while (!pendingRegions.empty() && !Desktop::View::validMapped(pendingRegions.front().lock())) {
++        if (const auto w = pendingRegions.front().lock())
++            g_canvasPendingWindows.erase(w->m_stableID);
++        pendingRegions.erase(pendingRegions.begin());
++    }
++    if (pendingRegions.empty()) {
++        resetSpawnRegion();
++        return;
++    }
++    if (!regionArmed)
++        resetSpawnRegion();
++    regionArmed    = true;
++    regionDeadline = std::numeric_limits<double>::infinity();
++    setCanvasCursor("crosshair");
++    const auto w = pendingRegions.front().lock();
++    HyprlandAPI::addNotification(SCROLLOVERVIEW_HANDLE, "Выделите область для окна: " + SpatialOverview::Navigator::displayTitle(w) + " · Esc: разместить автоматически",
++                                 CHyprColor{.5F, .8F, 1.F, 1.F}, 3500);
++    damage();
++}
++
++void CScrollOverview::finishPendingRegion(bool automatic) {
++    if (pendingRegions.empty()) {
++        resetSpawnRegion();
++        return;
++    }
++    const auto w = pendingRegions.front().lock();
++    pendingRegions.erase(pendingRegions.begin());
++    if (w)
++        g_canvasPendingWindows.erase(w->m_stableID);
++    if (Desktop::View::validMapped(w) && w->layoutTarget()) {
++        if (automatic) {
++            resetSpawnRegion();
++            g_canvasManagedTargets.erase(w->layoutTarget().get());
++            manageCanvasWindow(w, true);
++            followCanvasWindow(w, true);
++        } else {
++            applySpawnRegion(w);
++            canvasAdoptFocus(w);
++            Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
++        }
++        ensureCanvasKeyboardFocus(w);
++        revealPendingDialogs(w);
++    }
++    resetSpawnRegion();
++    if (!pendingRegions.empty())
++        startNextPendingRegion();
++    rebuildPending = true;
++    noteCanvasLayoutChanged();
++    damage();
++}
++
++void CScrollOverview::cancelSpawnRegion() {
++    if (!pendingRegions.empty())
++        finishPendingRegion(true);
++    else
++        resetSpawnRegion();
++}
++
++void CScrollOverview::forgetPendingRegion(PHLWINDOW window) {
++    if (!window)
++        return;
++    const bool first = !pendingRegions.empty() && pendingRegions.front().lock() == window;
++    g_canvasPendingWindows.erase(window->m_stableID);
++    std::erase_if(pendingRegions, [&](const auto& ref) { return !ref || ref.lock() == window; });
++    std::erase_if(pendingDialogs, [&](const auto& item) { return !item.first || item.first.lock() == window; });
++    revealPendingDialogs(window);
++    if (first) {
++        resetSpawnRegion();
++        startNextPendingRegion();
++    }
++}
++
++void CScrollOverview::clearPendingRegions() {
++    for (const auto& ref : pendingRegions)
++        if (const auto w = ref.lock())
++            g_canvasPendingWindows.erase(w->m_stableID);
++    pendingRegions.clear();
++    for (const auto& [child, parent] : pendingDialogs)
++        if (const auto w = child.lock())
++            g_canvasPendingWindows.erase(w->m_stableID);
++    pendingDialogs.clear();
++    // No placement on shutdown: the native layout restoration owns geometry.
++    regionArmed   = false;
++    regionDrawing = false;
++    spawnRegion.reset();
++}
+--- a/Config.cpp
++++ b/Config.cpp
+@@ -11,6 +11,7 @@
+ #include <hyprland/src/config/values/types/StringValue.hpp>
+ #include <hyprland/src/config/values/types/GradientValue.hpp>
+ #include <hyprland/src/managers/KeybindManager.hpp>
++#include <hyprland/src/config/shared/animation/AnimationTree.hpp>
+ 
+ #include <regex>
+ 
+@@ -47,6 +48,14 @@
+ 
+ SDispatcher* findDispatcher(const std::string_view name) {
+     static SDispatcher registrations[] = {
++        {
++            .name            = "mode",
++            .argPattern      = std::regex{"^(toggle|on|off|workspace|global|scope)$"},
++            .defaultArg      = "toggle",
++            .typeArgError    = "expected a string argument",
++            .invalidArgError = "expected toggle, on, off, workspace, global, or scope",
++            .luaFunction     = [](lua_State* L) { return dispatcherFactoryLua(L, "mode"); },
++        },
+         {
+             .name            = "overview",
+             .argPattern      = std::regex{R"(^(select|(toggle|on|open|enable|off|close|disable)([ \t]+(all|[^ \t"\\]+))?)$)"},
+@@ -71,7 +80,7 @@
+         },
+         {
+             .name            = "canvas",
+-            .argPattern      = std::regex{R"(^((place|viewport)[ \t]+-?[0-9]+[ \t]+-?[0-9]+|area[ \t]+[1-9][0-9]*|send[ \t]+[1-9][0-9]*([ \t]+stay)?|go[ \t]+([1-9][0-9]*|next|prev|back)|refresh|arrange|land|back|frame|undo|redo|fit|summon|tune|fill|pin|noop|search([ \t]+[^"\\]+)?|zoom[ \t]+(in|out)|(pan|nudge)[ \t]+(left|right|up|down)|native|maximize|fullscreen|restore|experiment[ \t]+(baseline|landing|labels|alttab|areas|quiet|persist|depth|lens|all|next|prev|status)|alttab[ \t]+(next|prev)|switch[ \t]+(next|prev))$)"},
++            .argPattern      = std::regex{R"(^((place|viewport)[ \t]+-?[0-9]+[ \t]+-?[0-9]+|area[ \t]+[1-9][0-9]*|send[ \t]+[1-9][0-9]*([ \t]+stay)?|go[ \t]+([1-9][0-9]*|next|prev|back)|capture-pointer|release-pointer|home|center|spawn-region|cancel-region|refresh|arrange|land|back|frame|undo|redo|fit|summon|tune|fill|pin|noop|search([ \t]+[^"\\]+)?|zoom[ \t]+(in|out)|(pan|nudge)[ \t]+(left|right|up|down)|native|maximize|fullscreen|restore|experiment[ \t]+(baseline|landing|labels|alttab|areas|quiet|persist|depth|lens|all|next|prev|status)|alttab[ \t]+(next|prev)|switch[ \t]+(next|prev))$)"},
+             .typeArgError    = "expected a string argument",
+             .invalidArgError = "expected: search [text] | tune | fill | pin | noop | fit | summon | zoom in|out | pan/nudge left|right|up|down | undo | redo | arrange | land | back | frame | place <column> <row> | viewport <x> <y> | area <id> | go <place>|next|prev|back | send <place> [stay] | refresh | native | maximize | fullscreen | restore | experiment <name> | alttab next|prev | switch next|prev",
+             .luaFunction     = [](lua_State* L) { return dispatcherFactoryLua(L, "canvas"); },
+@@ -275,6 +284,16 @@
+         lua_pushinteger(L, 3);
+         return 1;
+     });
++    HyprlandAPI::addLuaFunction(SCROLLOVERVIEW_HANDLE, "spatialoverview", "session", [](lua_State* L) {
++        lua_newtable(L);
++        lua_pushboolean(L, syspunkCanvasActive());
++        lua_setfield(L, -2, "active");
++        lua_pushstring(L, syspunkCanvasWorkspaceOnly() ? "workspace" : "global");
++        lua_setfield(L, -2, "scope");
++        lua_pushinteger(L, syspunkCanvasWorkspaceID());
++        lua_setfield(L, -2, "workspace_id");
++        return 1;
++    });
+     // Where the live tuner saves, so the config can apply it (level 3).
+     HyprlandAPI::addLuaFunction(SCROLLOVERVIEW_HANDLE, "spatialoverview", "tuning_file", [](lua_State* L) {
+         lua_pushstring(L, SpatialOverview::Tuning::filePath().c_str());
+@@ -302,12 +321,18 @@
+                                   makeShared<CFloatValue>("plugin:spatialoverview:input:pan_sensitivity", "free camera drag sensitivity", 1.F,
+                                                           SFloatValueOptions{.min = 0.05F, .max = 5.F}));
+     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
++                                  makeShared<CBoolValue>("plugin:spatialoverview:animation:inherit", "inherit unset camera animation options from windowsMove", true));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
+                                   makeShared<CBoolValue>("plugin:spatialoverview:animation:enabled", "animate overview camera transitions", true));
+     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
+                                   makeShared<CFloatValue>("plugin:spatialoverview:animation:speed", "overview camera animation speed", 8.F,
+                                                           SFloatValueOptions{.min = 0.1F, .max = 30.F}));
+     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
+                                   makeShared<CStringValue>("plugin:spatialoverview:animation:bezier", "overview camera animation curve", Hyprlang::STRING{"default"}));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
++                                  makeShared<CGradientValue>("plugin:spatialoverview:canvas:accent", "canvas UI accent; inherits active border unless explicitly set", -1));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
++                                  makeShared<CGradientValue>("plugin:spatialoverview:canvas:panel_color", "minimap background; inherits inactive border unless explicitly set", -1));
+     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE, makeShared<CBoolValue>("plugin:spatialoverview:distortion:enabled", "enable barrel distortion", true));
+     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
+                                   makeShared<CFloatValue>("plugin:spatialoverview:distortion:strength", "barrel distortion strength", 0.14F,
+@@ -449,6 +474,13 @@
+     HyprlandAPI::addConfigValueV2(
+         SCROLLOVERVIEW_HANDLE,
+         makeShared<CBoolValue>("plugin:spatialoverview:canvas:commit_viewport_on_close", "make the freely panned viewport the normal desktop view when overview closes", true));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE, makeShared<CBoolValue>("plugin:spatialoverview:canvas:spawn_on_open", "draw a placement region for each new standalone window", false));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE, makeShared<CBoolValue>("plugin:spatialoverview:canvas:inertia_enabled", "inertial canvas and window throws", false));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE, makeShared<CBoolValue>("plugin:spatialoverview:canvas:magnet_enabled", "align window edges while moving or resizing", false));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE, makeShared<CBoolValue>("plugin:spatialoverview:canvas:magnet_guides", "show magnetic alignment guides", false));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE, makeShared<CBoolValue>("plugin:spatialoverview:canvas:double_border", "draw contrasting inner and outer canvas borders", false));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE, makeShared<CIntValue>("plugin:spatialoverview:canvas:magnet_distance", "magnetic capture radius in screen pixels", 12, SIntValueOptions{.min = 1, .max = 48}));
++    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE, makeShared<CIntValue>("plugin:spatialoverview:canvas:magnet_gap", "gap between magnetically aligned windows", 12, SIntValueOptions{.min = 0, .max = 128}));
+     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
+                                   makeShared<CBoolValue>("plugin:spatialoverview:canvas:snap_enabled", "snap canvas window positions to the world grid", true));
+     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
+@@ -573,15 +605,44 @@
+ }
+ 
+ bool getAnimationEnabled() {
+-    return getValue<bool>("plugin:spatialoverview:animation:enabled");
++    // Never override the user's global reduced-motion preference.
++    if (!getValue<bool>("animations:enabled"))
++        return false;
++    constexpr auto NAME = "plugin:spatialoverview:animation:enabled";
++    if (!getValue<bool>("plugin:spatialoverview:animation:inherit") || ::Config::mgr()->getConfigValue(NAME).setByUser)
++        return getValue<bool>(NAME);
++    const auto node = ::Config::animationTree()->getAnimationPropertyConfig("windowsMove");
++    const auto values = node && node->pValues ? node->pValues.lock() : node;
++    return values && values->internalEnabled;
+ }
+ 
+ float getAnimationSpeed() {
+-    return std::clamp(getValue<float>("plugin:spatialoverview:animation:speed"), 0.1F, 30.F);
++    constexpr auto NAME = "plugin:spatialoverview:animation:speed";
++    if (!getValue<bool>("plugin:spatialoverview:animation:inherit") || ::Config::mgr()->getConfigValue(NAME).setByUser)
++        return std::clamp(getValue<float>(NAME), 0.1F, 30.F);
++    const auto node = ::Config::animationTree()->getAnimationPropertyConfig("windowsMove");
++    const auto values = node && node->pValues ? node->pValues.lock() : node;
++    return values ? std::clamp(values->internalSpeed, 0.1F, 30.F) : 8.F;
+ }
+ 
+ std::string getAnimationBezier() {
+-    return getValue<std::string>("plugin:spatialoverview:animation:bezier");
++    constexpr auto NAME = "plugin:spatialoverview:animation:bezier";
++    if (!getValue<bool>("plugin:spatialoverview:animation:inherit") || ::Config::mgr()->getConfigValue(NAME).setByUser)
++        return getValue<std::string>(NAME);
++    const auto node = ::Config::animationTree()->getAnimationPropertyConfig("windowsMove");
++    const auto values = node && node->pValues ? node->pValues.lock() : node;
++    return values ? values->internalBezier : "default";
++}
++
++::Config::CGradientValueData getCanvasAccent() {
++    constexpr auto NAME = "plugin:spatialoverview:canvas:accent";
++    return getValue<::Config::CGradientValueData>(::Config::mgr()->getConfigValue(NAME).setByUser ? NAME : "general:col.active_border");
++}
++
++CHyprColor getCanvasPanelColor() {
++    constexpr auto NAME = "plugin:spatialoverview:canvas:panel_color";
++    const auto gradient = getValue<::Config::CGradientValueData>(::Config::mgr()->getConfigValue(NAME).setByUser ? NAME : "general:col.inactive_border");
++    return gradient.m_colors.empty() ? CHyprColor{0, 0, 0, 0} : gradient.m_colors.front();
+ }
+ 
+ bool getBarrelEnabled() {
+--- a/Config.hpp
++++ b/Config.hpp
+@@ -94,6 +94,8 @@
+ bool          getAnimationEnabled();
+ float         getAnimationSpeed();
+ std::string   getAnimationBezier();
++::Config::CGradientValueData getCanvasAccent();
++CHyprColor    getCanvasPanelColor();
+ bool          getBarrelEnabled();
+ float         getBarrelStrength();
+ float         getBarrelEdgeScale();
+--- a/Cursor.cpp
++++ b/Cursor.cpp
+@@ -37,3 +37,9 @@
+     const auto SURFACE = CURSOR.wlSurface ? CURSOR.wlSurface->resource() : nullptr;
+     return SURFACE && SURFACE->m_current.size.x <= 1.0 && SURFACE->m_current.size.y <= 1.0;
+ }
++
++// The canvas cancels native hit testing after projecting a pointer lock.
++// Keep the native early-out cache in the coordinates the pointer actually has.
++void canvasRememberPointerPosition(const Vector2D& position) {
++    g_pInputManager->m_lastCursorPosFloored = position.floor();
++}
+--- a/Makefile
++++ b/Makefile
+@@ -20,7 +20,7 @@
+     EXTRA_FLAGS += -fno-gnu-unique
+ endif
+ 
+-.PHONY: all clean safe-unload test-tools test-dnd-route FORCE
++.PHONY: all clean safe-unload test-tools test-dnd-route test-physics FORCE
+ 
+ all: $(OBJECTS)
+ 	@mkdir -p $(dir $(OUT))
+@@ -29,6 +29,7 @@
+ 
+ # The lens shader is compiled into the plugin (#embed in BarrelShader.cpp).
+ $(OBJDIR)/BarrelShader.o: shaders/barrel.frag
++$(OBJDIR)/scrollOverview.o: CanvasFeatures.inc CanvasPlacement.inc CanvasInput.inc
+ 
+ $(OBJDIR)/%.o: %.cpp $(VERSION_HEADER) $(wildcard *.hpp)
+ 	@mkdir -p $(OBJDIR)
+@@ -68,6 +69,12 @@
+ 	$(CXX) -std=c++2b -Wall -Wextra -I. tests/canvas-dnd-route-test.cpp -o .build/canvas-dnd-route-test
+ 	.build/canvas-dnd-route-test
+ 
++# Inertia and magnetic geometry, without a compositor.
++test-physics:
++	@mkdir -p .build
++	$(CXX) -std=c++2b -Wall -Wextra -I. tests/canvas-physics-test.cpp -o .build/canvas-physics-test
++	.build/canvas-physics-test
++
+ # Helper that install-live.sh loads to unload the running build safely.
+ SAFE_UNLOAD = .build/safe-unload.so
+ 
+--- a/Memory.cpp
++++ b/Memory.cpp
+@@ -1,7 +1,6 @@
+ #define WLR_USE_UNSTABLE
+-
+ #include "Memory.hpp"
+-
++#include "Navigator.hpp"
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdlib>
+@@ -10,72 +9,99 @@
+ #include <fstream>
+ #include <iomanip>
+ #include <sstream>
+-
++#include <sys/stat.h>
++#include <unistd.h>
+ #include <hyprland/src/desktop/state/WindowState.hpp>
+ #include <hyprland/src/desktop/view/Window.hpp>
+ 
+-#include "Navigator.hpp"
+-
+ namespace SpatialOverview::Memory {
+     namespace {
+-        struct SEntry {
+-            std::string klass;
+-            std::string title;
++        struct Entry {
++            std::string scope, klass, title;
+             CBox        box;
+             int64_t     seen   = 0;
+-            uint64_t    window = 0; // stable id of the open window this entry describes
++            uint64_t    window = 0;
+         };
++        struct CameraEntry {
++            std::string scope, monitor;
++            SCamera     camera;
++        };
++        bool                     loaded = false;
++        std::vector<Entry>       entries;
++        std::vector<CameraEntry> cameras;
++        constexpr size_t         MAX_ENTRIES = 512, MAX_CAMERAS = 128;
+ 
+-        constexpr size_t MAX_ENTRIES = 96;
+-
+-        bool                                      g_loaded = false;
+-        std::vector<SEntry>                       g_entries;
+-        std::unordered_map<std::string, Vector2D> g_cameras;
+-
+-        // Hand-edited or damaged files must never feed NaN, infinity or
+-        // absurd sizes into window geometry or the camera.
+-        bool sane(double value, double limit) {
+-            return std::isfinite(value) && std::abs(value) <= limit;
++        bool                     sane(double n, double limit) {
++            return std::isfinite(n) && std::abs(n) <= limit;
+         }
+-
+-        bool saneBox(const CBox& box) {
+-            return sane(box.x, 1e6) && sane(box.y, 1e6) && sane(box.width, 16384) && sane(box.height, 16384) && box.width >= 1 && box.height >= 1;
++        bool saneBox(const CBox& b) {
++            return sane(b.x, 1e6) && sane(b.y, 1e6) && sane(b.w, 16384) && sane(b.h, 16384) && b.w >= 1 && b.h >= 1;
+         }
+-
+-        std::string clean(std::string value) {
+-            std::ranges::replace(value, '\t', ' ');
+-            std::ranges::replace(value, '\n', ' ');
+-            std::ranges::replace(value, '\r', ' ');
+-            return value;
++        bool saneCamera(const SCamera& c) {
++            return sane(c.offset.x, 1e6) && sane(c.offset.y, 1e6) && sane(c.zoom, 10) && c.zoom >= .01;
+         }
+-
++        std::string clean(std::string s) {
++            for (auto& c : s)
++                if (c == '\t' || c == '\n' || c == '\r')
++                    c = ' ';
++            if (s.size() > 2048)
++                s.resize(2048);
++            return s;
++        }
+         void load() {
+-            if (g_loaded)
++            if (loaded)
+                 return;
+-            g_loaded = true;
+-
+-            std::ifstream in{path()};
++            loaded = true;
++            std::error_code ec;
++            const auto      size = std::filesystem::file_size(path(), ec);
++            if (ec || size > 2 * 1024 * 1024)
++                return;
++            std::ifstream in(path());
+             std::string   line;
+-            while (in && std::getline(in, line)) {
+-                std::vector<std::string> fields;
+-                std::string              field;
+-                std::istringstream       stream{line};
+-                while (std::getline(stream, field, '\t'))
+-                    fields.push_back(field);
+-                try {
+-                    if (fields.size() == 4 && fields[0] == "camera") {
+-                        const Vector2D CAMERA{std::stod(fields[2]), std::stod(fields[3])};
+-                        if (sane(CAMERA.x, 1e6) && sane(CAMERA.y, 1e6))
+-                            g_cameras[fields[1]] = CAMERA;
+-                    } else if (fields.size() == 8 && fields[0] == "window") {
+-                        const CBox BOX{std::stod(fields[3]), std::stod(fields[4]), std::stod(fields[5]), std::stod(fields[6])};
+-                        if (saneBox(BOX))
+-                            g_entries.push_back({.klass = fields[1], .title = fields[2], .box = BOX, .seen = std::stoll(fields[7])});
+-                    }
+-                } catch (...) {
+-                    // A damaged line only costs that one window its memory.
++            if (!std::getline(in, line) || line != "# hotlilit canvas memory v2")
++                return;
++            size_t lines = 0;
++            while (std::getline(in, line) && ++lines <= MAX_ENTRIES + MAX_CAMERAS + 32) {
++                if (line.size() > 8192)
++                    continue;
++                std::istringstream row(line);
++                std::string        kind;
++                row >> kind;
++                if (kind == "window" && entries.size() < MAX_ENTRIES) {
++                    Entry e;
++                    if (row >> std::quoted(e.scope) >> std::quoted(e.klass) >> std::quoted(e.title) >> e.box.x >> e.box.y >> e.box.w >> e.box.h >> e.seen)
++                        if (!e.scope.empty() && !e.klass.empty() && saneBox(e.box))
++                            entries.push_back(std::move(e));
++                } else if (kind == "camera" && cameras.size() < MAX_CAMERAS) {
++                    CameraEntry e;
++                    if (row >> std::quoted(e.scope) >> std::quoted(e.monitor) >> e.camera.offset.x >> e.camera.offset.y >> e.camera.zoom)
++                        if (!e.scope.empty() && !e.monitor.empty() && saneCamera(e.camera))
++                            cameras.push_back(std::move(e));
+                 }
+             }
++        }
++        void write() {
++            std::error_code ec;
++            const auto      dest = std::filesystem::path(path());
++            std::filesystem::create_directories(dest.parent_path(), ec);
++            if (ec)
++                return;
++            const auto    temp = path() + ".next-" + std::to_string(getpid());
++            std::ofstream out(temp, std::ios::trunc);
++            if (!out)
++                return;
++            chmod(temp.c_str(), 0600);
++            out << "# hotlilit canvas memory v2\n" << std::setprecision(12);
++            for (const auto& c : cameras)
++                out << "camera " << std::quoted(c.scope) << ' ' << std::quoted(c.monitor) << ' ' << c.camera.offset.x << ' ' << c.camera.offset.y << ' ' << c.camera.zoom << '\n';
++            for (const auto& e : entries)
++                out << "window " << std::quoted(e.scope) << ' ' << std::quoted(e.klass) << ' ' << std::quoted(e.title) << ' ' << e.box.x << ' ' << e.box.y << ' ' << e.box.w << ' '
++                    << e.box.h << ' ' << e.seen << '\n';
++            out.close();
++            if (out)
++                std::filesystem::rename(temp, dest, ec);
++            if (!out || ec)
++                std::filesystem::remove(temp, ec);
+         }
+     }
+ 
+@@ -84,111 +110,82 @@
+         if (const char* state = std::getenv("XDG_STATE_HOME"); state && *state)
+             base = state;
+         else
+-            base = std::filesystem::path{std::getenv("HOME") ? std::getenv("HOME") : "/tmp"} / ".local" / "state";
+-        return (base / "spatial-overview" / "canvas-memory.tsv").string();
++            base = std::filesystem::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".local/state";
++        return (base / "hotlilit/canvas-memory-v2.txt").string();
+     }
+ 
+-    std::optional<CBox> claim(const PHLWINDOW& window, bool restoring) {
++    std::optional<CBox> claim(const PHLWINDOW& window, bool restoring, const std::string& scope) {
+         if (!window)
+-            return std::nullopt;
++            return {};
+         load();
+-
+-        const auto KLASS = clean(window->m_class.empty() ? window->m_initialClass : window->m_class);
+-        const auto TITLE = clean(Navigator::displayTitle(window));
+-        if (KLASS.empty())
+-            return std::nullopt;
+-
+-        SEntry* best = nullptr;
+-        for (auto& entry : g_entries) {
+-            if (entry.window || entry.klass != KLASS)
++        const auto klass = clean(window->m_class.empty() ? window->m_initialClass : window->m_class);
++        const auto title = clean(Navigator::displayTitle(window));
++        if (klass.empty())
++            return {};
++        const auto& live = Desktop::windowState()->windows();
++        Entry*      best = nullptr;
++        for (auto& e : entries) {
++            if (e.scope != scope || e.klass != klass)
+                 continue;
+-            if (entry.title == TITLE && (!best || best->title != TITLE || entry.seen > best->seen))
+-                best = &entry;
+-            else if (restoring && (!best || (best->title != TITLE && entry.seen > best->seen)))
+-                best = &entry;
++            if (e.window == window->m_stableID)
++                return e.box;
++            if (e.window && std::ranges::none_of(live, [&](const auto& w) { return w && w->m_isMapped && w->m_stableID == e.window; }))
++                e.window = 0;
++            if (e.window)
++                continue;
++            if (e.title == title && (!best || best->title != title || e.seen > best->seen))
++                best = &e;
++            else if (restoring && (!best || (best->title != title && e.seen > best->seen)))
++                best = &e;
+         }
+-        if (!best)
+-            return std::nullopt;
+-
+-        if (!restoring) {
+-            // Outside a restore, only a lone app returning to its own spot:
+-            // a second terminal belongs next to you, not in the first one's
+-            // old place.
+-            if (best->title != TITLE)
+-                return std::nullopt;
+-            const auto& WINDOWS = Desktop::windowState()->windows();
+-            const bool  SIBLING = std::ranges::any_of(WINDOWS, [&](const PHLWINDOW& other) {
+-                return other && other != window && other->m_isMapped && clean(other->m_class) == KLASS;
+-            });
+-            if (SIBLING)
+-                return std::nullopt;
+-        }
+-
++        if (!best || (!restoring && best->title != title))
++            return {};
+         best->window = window->m_stableID;
+         return best->box;
+     }
+ 
+-    std::optional<Vector2D> camera(const std::string& monitor) {
++    std::optional<SCamera> camera(const std::string& monitor, const std::string& scope) {
+         load();
+-        if (const auto IT = g_cameras.find(monitor); IT != g_cameras.end())
+-            return IT->second;
+-        return std::nullopt;
++        for (const auto& e : cameras)
++            if (e.scope == scope && e.monitor == monitor)
++                return e.camera;
++        return {};
+     }
+ 
+-    void save(const std::vector<SWindowPlacement>& windows, const std::unordered_map<std::string, Vector2D>& cameras) {
++    void save(const std::vector<SWindowPlacement>& windows, const std::unordered_map<std::string, SCamera>& views, const std::string& scope) {
+         load();
+-        const int64_t NOW = std::time(nullptr);
+-
+-        std::vector<SEntry> next;
+-        next.reserve(windows.size() + g_entries.size());
+-        for (const auto& placement : windows) {
+-            if (!placement.window || !saneBox(placement.box))
++        const int64_t now = std::time(nullptr);
++        for (const auto& p : windows) {
++            if (!p.window || !saneBox(p.box))
+                 continue;
+-            const auto KLASS = clean(placement.window->m_class.empty() ? placement.window->m_initialClass : placement.window->m_class);
+-            if (KLASS.empty())
++            const auto klass = clean(p.window->m_class.empty() ? p.window->m_initialClass : p.window->m_class);
++            const auto title = clean(Navigator::displayTitle(p.window));
++            if (klass.empty())
+                 continue;
+-            next.push_back({.klass = KLASS, .title = clean(Navigator::displayTitle(placement.window)), .box = placement.box, .seen = NOW,
+-                            .window = placement.window->m_stableID});
++            auto it = std::ranges::find_if(entries, [&](const Entry& e) { return e.scope == scope && e.window == p.window->m_stableID; });
++            if (it == entries.end()) {
++                // A previously closed window can reclaim an exact home. Do not
++                // merge two simultaneous windows with the same class/title.
++                it = std::ranges::find_if(entries, [&](const Entry& e) { return e.scope == scope && !e.window && e.klass == klass && e.title == title && e.box == p.box; });
++            }
++            Entry e{scope, klass, title, p.box, now, p.window->m_stableID};
++            if (it == entries.end())
++                entries.push_back(std::move(e));
++            else
++                *it = std::move(e);
+         }
+-
+-        // Entries describing a window that is still open are superseded by
+-        // the lines above; a window that has closed keeps its last home.
+-        for (auto entry : g_entries) {
+-            if (entry.window && std::ranges::any_of(windows, [&entry](const SWindowPlacement& placement) {
+-                    return placement.window && placement.window->m_stableID == entry.window;
+-                }))
++        std::ranges::stable_sort(entries, [](const Entry& a, const Entry& b) { return a.seen > b.seen; });
++        if (entries.size() > MAX_ENTRIES)
++            entries.resize(MAX_ENTRIES);
++        for (const auto& [monitor, view] : views) {
++            if (!saneCamera(view))
+                 continue;
+-            entry.window = 0;
+-            const bool DUPLICATE = std::ranges::any_of(next, [&entry](const SEntry& current) {
+-                return current.klass == entry.klass && current.title == entry.title && current.box == entry.box;
+-            });
+-            if (!DUPLICATE)
+-                next.push_back(entry);
++            auto it = std::ranges::find_if(cameras, [&](const CameraEntry& e) { return e.scope == scope && e.monitor == monitor; });
++            if (it != cameras.end())
++                it->camera = view;
++            else if (cameras.size() < MAX_CAMERAS)
++                cameras.push_back({scope, monitor, view});
+         }
+-
+-        std::ranges::stable_sort(next, [](const SEntry& a, const SEntry& b) { return a.seen > b.seen; });
+-        if (next.size() > MAX_ENTRIES)
+-            next.resize(MAX_ENTRIES);
+-        g_entries = std::move(next);
+-        for (const auto& [monitor, offset] : cameras) {
+-            if (sane(offset.x, 1e6) && sane(offset.y, 1e6))
+-                g_cameras[monitor] = offset;
+-        }
+-
+-        std::error_code error;
+-        std::filesystem::create_directories(std::filesystem::path{path()}.parent_path(), error);
+-        const auto    TEMPORARY = path() + ".next";
+-        std::ofstream out{TEMPORARY, std::ios::trunc};
+-        if (!out)
+-            return;
+-        out << std::fixed << std::setprecision(1) << "# spatial-overview canvas memory v1\n";
+-        for (const auto& [monitor, offset] : g_cameras)
+-            out << "camera\t" << clean(monitor) << '\t' << offset.x << '\t' << offset.y << '\n';
+-        for (const auto& entry : g_entries)
+-            out << "window\t" << entry.klass << '\t' << entry.title << '\t' << entry.box.x << '\t' << entry.box.y << '\t' << entry.box.width << '\t' << entry.box.height
+-                << '\t' << entry.seen << '\n';
+-        out.close();
+-        if (out)
+-            std::filesystem::rename(TEMPORARY, path(), error);
++        write();
+     }
+ }
+--- a/Memory.hpp
++++ b/Memory.hpp
+@@ -20,12 +20,17 @@
+         CBox      box;
+     };
+ 
++    struct SCamera {
++        Vector2D offset;
++        float    zoom = 1.F;
++    };
++
+     // restoring: true while a fresh canvas is being populated (login, first
+     // open). Then any window of a remembered app may take that app's most
+-    // recent free spot; afterwards only an exact title match of an app with
+-    // no other open window comes home.
+-    std::optional<CBox>     claim(const PHLWINDOW& window, bool restoring);
+-    std::optional<Vector2D> camera(const std::string& monitor);
+-    void                    save(const std::vector<SWindowPlacement>& windows, const std::unordered_map<std::string, Vector2D>& cameras);
+-    std::string             path();
++    // recent free spot; afterwards an exact title match is required. Claims
++    // are unique per live window within a scope, including same-title siblings.
++    std::optional<CBox>    claim(const PHLWINDOW& window, bool restoring, const std::string& scope = "global");
++    std::optional<SCamera> camera(const std::string& monitor, const std::string& scope = "global");
++    void                   save(const std::vector<SWindowPlacement>& windows, const std::unordered_map<std::string, SCamera>& cameras, const std::string& scope = "global");
++    std::string            path();
+ }
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,5 @@
++> **HotLilith contributors:** this is retained Phantomat reference documentation. Use the [root README](../README.md) and [root installer](../install.py) for the supported HotLilith preset. Upstream installation commands below deploy different bindings.
++
+ # Phantomat
+ 
+ A zoomable, infinite-canvas window manager for Hyprland. Every window lives
+--- a/Tuning.cpp
++++ b/Tuning.cpp
+@@ -252,6 +252,10 @@
+ 
+         void apply(const SParam& param, double value) {
+             const auto KEY = fullKey(param);
++            // A camera slider is an explicit override, including its default
++            // value. Direct value writes do not set Hyprland's setByUser flag.
++            if (std::string_view(param.key).starts_with("animation:"))
++                ScrollOverview::Config::setValue("plugin:spatialoverview:animation:inherit", false);
+             if (std::string_view(param.key) == "animation:speed") {
+                 // value is speed multiplier (e.g. 2.0x). Convert to duration in deciseconds: 8.0 / value.
+                 float durationDs = sc<float>(value > 1e-4 ? (8.0 / value) : 8.0);
+--- a/globals.hpp
++++ b/globals.hpp
+@@ -1,8 +1,19 @@
+ #pragma once
+ 
+ #include <hyprland/src/plugins/PluginAPI.hpp>
++#include <hyprland/src/desktop/DesktopTypes.hpp>
+ 
+ inline HANDLE SCROLLOVERVIEW_HANDLE = nullptr;
+ 
+ bool ensureScrollOverviewHooks();
+ void disableScrollOverviewHooks();
++
++// Syspunk: mode lifecycle is independent of overview/navigation zoom.
++bool syspunkCanvasActive();
++bool syspunkCanvasCompatible(PHLWORKSPACE workspace, bool workspaceOnly);
++bool syspunkCanvasWorkspaceOnly();
++int64_t syspunkCanvasWorkspaceID();
++void syspunkCanvasPrepare(PHLWORKSPACE workspace, bool workspaceOnly);
++void syspunkCanvasStop();
++bool canvasSuppressRelativeMotion();
++bool canvasReleasePointerCapture();
+--- a/main.cpp
++++ b/main.cpp
+@@ -51,6 +51,7 @@
+ static CFunctionHook* g_pX11ConfigureHook          = nullptr;
+ static CFunctionHook* g_pX11ConfigureRequestHook   = nullptr;
+ static CFunctionHook* g_pX11ClientMessageHook      = nullptr;
++static CFunctionHook* g_pCanvasRelativeHook = nullptr;
+ 
+ namespace Desktop::View {
+     class CPopup;
+@@ -60,6 +61,7 @@
+ CBox canvasX11Configure(void* surface, const CBox& box);
+ CBox canvasX11Request(void* window, CBox box);
+ void canvasReleaseX11Windows();
++bool canvasCapturePointer();
+ typedef void (*origRenderWorkspace)(void*, PHLMONITOR, PHLWORKSPACE, const Time::steady_tp&, const CBox&);
+ typedef void (*origAddDamageA)(void*, const CBox&);
+ typedef void (*origAddDamageB)(void*, const pixman_region32_t*);
+@@ -71,6 +73,11 @@
+ typedef void (*origElementDrawTex)(void*, WP<CTexPassElement>, const CRegion&);
+ 
+ static bool g_unloading = false;
++using origCanvasRelative = void (*)(void*, uint64_t, const Vector2D&, const Vector2D&);
++static void hkCanvasRelative(void* self, uint64_t time, const Vector2D& delta, const Vector2D& raw) {
++    if (!g_unloading && canvasSuppressRelativeMotion()) return;
++    reinterpret_cast<origCanvasRelative>(g_pCanvasRelativeHook->m_original)(self, time, delta, raw);
++}
+ 
+ // Do NOT change this function.
+ APICALL EXPORT std::string PLUGIN_API_VERSION() {
+@@ -101,6 +108,7 @@
+     success      = success && g_pBeginDragTargetHook->hook();
+     success      = success && g_pX11ConfigureHook->hook();
+     success      = success && g_pX11ConfigureRequestHook->hook();
++    success      = success && g_pCanvasRelativeHook->hook();
+ 
+     if (!success) {
+         disableScrollOverviewHooks();
+@@ -113,6 +121,7 @@
+ }
+ 
+ void disableScrollOverviewHooks() {
++    if (g_pCanvasRelativeHook) g_pCanvasRelativeHook->unhook();
+     if (g_pX11ConfigureRequestHook)
+         g_pX11ConfigureRequestHook->unhook();
+     if (g_pX11ConfigureHook)
+@@ -531,6 +540,46 @@
+     return {};
+ }
+ 
++// A real mode toggle: closing restores native window states, not just 100% zoom.
++static SDispatchResult onModeDispatcher(std::string arg) {
++    const bool WAS_ACTIVE = syspunkCanvasActive();
++    bool workspaceOnly = syspunkCanvasWorkspaceOnly();
++    const bool SCOPE_CHANGE = arg == "scope" || arg == "workspace" || arg == "global";
++    if (arg == "scope") workspaceOnly = !workspaceOnly;
++    else if (arg == "workspace") workspaceOnly = true;
++    else if (arg == "global") workspaceOnly = false;
++    else if (arg != "toggle" && arg != "on" && arg != "off")
++        return {.success = false, .error = "invalid canvas mode action"};
++
++    const auto MONITOR = Desktop::focusState()->monitor();
++    const bool WILL_OPEN = arg != "off" && !(arg == "toggle" && WAS_ACTIVE) && (!SCOPE_CHANGE || WAS_ACTIVE);
++    if (WILL_OPEN && (!MONITOR || !syspunkCanvasCompatible(MONITOR->m_activeWorkspace, workspaceOnly)))
++        return {.success = false, .error = "Ungroup windows in the requested scope before opening the canvas"};
++
++    if (arg == "off" || (arg == "toggle" && WAS_ACTIVE) || SCOPE_CHANGE) {
++        syspunkCanvasStop();
++        disableScrollOverviewHooks();
++    }
++    if (arg == "off" || (arg == "toggle" && WAS_ACTIVE))
++        return {};
++    if (!MONITOR)
++        return {.success = false, .error = "no focused monitor"};
++    if (SCOPE_CHANGE && !WAS_ACTIVE) {
++        syspunkCanvasPrepare(MONITOR->m_activeWorkspace, workspaceOnly);
++        return {};
++    }
++    if (!WAS_ACTIVE || SCOPE_CHANGE) {
++        syspunkCanvasPrepare(MONITOR->m_activeWorkspace, workspaceOnly);
++        auto result = onOverviewDispatcher(workspaceOnly ? "open" : "open all");
++        if (!result.success) {
++            syspunkCanvasStop();
++            disableScrollOverviewHooks();
++        }
++        return result;
++    }
++    return {};
++}
++
+ static SDispatchResult onNavigateDispatcher(std::string arg) {
+     // Window ownership is only a surface-storage detail in the shared canvas.
+     // Route arrows through the last camera the user actually interacted with,
+@@ -592,6 +641,12 @@
+ }
+ 
+ static SDispatchResult onCanvasDispatcher(std::string arg) {
++    if (arg == "capture-pointer")
++        return canvasCapturePointer() ? SDispatchResult{} : SDispatchResult{.success=false,.error="Focus a window on the canvas first"};
++    if (arg == "release-pointer") {
++        canvasReleasePointerCapture();
++        return {};
++    }
+     if (arg.starts_with("experiment ")) {
+         const auto PREVIOUS = SpatialOverview::Experiments::id();
+         const auto NAME = arg.substr(11);
+@@ -639,7 +694,7 @@
+                                                                                                                                 : SDispatchResult{.success = false, .error = "Open the canvas before using this action"};
+     if (!CANVAS)
+         return arg == "refresh" ? SDispatchResult{} : SDispatchResult{.success = false, .error = "Open the canvas before using this action"};
+-    if (arg == "back" || arg == "land" || arg == "frame" || arg == "undo" || arg == "redo" || arg == "fit" || arg == "summon" || arg == "search" || arg == "tune" ||
++    if (arg == "home" || arg == "center" || arg == "spawn-region" || arg == "cancel-region" || arg == "back" || arg == "land" || arg == "frame" || arg == "undo" || arg == "redo" || arg == "fit" || arg == "summon" || arg == "search" || arg == "tune" ||
+         arg.starts_with("search ") || arg.starts_with("zoom ") || arg.starts_with("pan ") || arg.starts_with("nudge ") || arg.starts_with("area ") || arg.starts_with("go ") ||
+         arg.starts_with("send "))
+         return CANVAS->flightDeckAction(arg) ? SDispatchResult{} : SDispatchResult{.success = false, .error = "No matching window, area or undo state"};
+@@ -832,7 +887,7 @@
+         rc<void*>(hkRenderWorkspace));
+ 
+     g_pScrollScheduleFrameHook = HyprlandAPI::createFunctionHook(
+-        SCROLLOVERVIEW_HANDLE, 
++        SCROLLOVERVIEW_HANDLE,
+         findFnOrThrow("_ZN7Monitor8CMonitor13scheduleFrameEN10Aquamarine7IOutput19scheduleFrameReasonE", {""}),
+         rc<void*>(hkScheduleFrame));
+ 
+@@ -879,6 +934,9 @@
+                                                           rc<void*>(hkX11Configure));
+     g_pX11ConfigureRequestHook = HyprlandAPI::createFunctionHook(SCROLLOVERVIEW_HANDLE, findFnOrThrow("onX11ConfigureRequest", {"CWindow::onX11ConfigureRequest("}),
+                                                                  rc<void*>(hkX11ConfigureRequest));
++
++    g_pCanvasRelativeHook = HyprlandAPI::createFunctionHook(SCROLLOVERVIEW_HANDLE,
++        findFnOrThrow("sendRelativeMotion", {"CRelativePointerProtocol::sendRelativeMotion("}), rc<void*>(hkCanvasRelative));
+ 
+     g_pX11ClientMessageHook = HyprlandAPI::createFunctionHook(SCROLLOVERVIEW_HANDLE, findFnOrThrow("handleClientMessage", {"CXWM::handleClientMessage("}),
+                                                               rc<void*>(hkX11ClientMessage));
+@@ -949,6 +1007,7 @@
+                                                              return canvasStateJson();
+                                                          }});
+ 
++    ScrollOverview::Config::registerDispatcher("mode", ::onModeDispatcher);
+     ScrollOverview::Config::registerDispatcher("overview", ::onOverviewDispatcher);
+     ScrollOverview::Config::registerDispatcher("navigate", ::onNavigateDispatcher);
+     ScrollOverview::Config::registerDispatcher("window", ::onWindowDispatcher);
+--- a/scrollOverview.cpp
++++ b/scrollOverview.cpp
+@@ -17,6 +17,7 @@
+ #include <set>
+ #include <string_view>
+ #include <unordered_set>
++#include <utility>
+ #include <linux/input-event-codes.h>
+ #include <state/MonitorState.hpp>
+ #include <state/WorkspaceState.hpp>
+@@ -30,6 +31,7 @@
+ #include <hyprland/src/config/shared/animation/AnimationTree.hpp>
+ #include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
+ #include <hyprland/src/protocols/PointerConstraints.hpp>
++#include <hyprland/src/protocols/XDGShell.hpp>
+ #include <hyprland/src/pointer/PointerController.hpp>
+ #include <hyprland/src/event/EventBus.hpp>
+ #include <hyprland/src/animation/AnimationManager.hpp>
+@@ -43,6 +45,7 @@
+ #include <hyprland/src/layout/space/Space.hpp>
+ #include <hyprland/src/layout/target/Target.hpp>
+ #include <hyprland/src/layout/algorithm/tiled/scrolling/ScrollingAlgorithm.hpp>
++#include <hyprland/src/layout/algorithm/tiled/dwindle/DwindleAlgorithm.hpp>
+ #include <hyprland/src/desktop/state/GlobalWindowController.hpp>
+ #include <hyprland/src/pointer/cursor/CursorShapeOverrideController.hpp>
+ #include <hyprland/src/desktop/state/FocusState.hpp>
+@@ -88,6 +91,10 @@
+ #include "OverviewRender.hpp"
+ #include "Window.hpp"
+ 
++static int saveCanvasMemory(void*);
++static std::unordered_set<uint64_t> g_canvasPendingWindows;
++static std::unordered_set<uint64_t> g_canvasCaptureBlocked;
++static PHLWINDOWREF g_canvasManualCapture;
+ static PHLWINDOW getOverviewFullscreenVisibilityWindow(const PHLWORKSPACE& workspace, const PHLWINDOW& fallback = {});
+ static constexpr const char* OVERVIEW_SUBMAP = "spatialoverview";
+ static constexpr auto        POST_DROP_PSEUDO_FOCUS_DURATION = std::chrono::milliseconds(100);
+@@ -107,13 +114,106 @@
+     CBox box;
+     bool floating;
+     Fullscreen::SFullscreenMode fullscreen;
++    PHLMONITORREF monitor;
++    CBox monitorBox;
+ };
+ static std::unordered_map<uint64_t, SCanvasSavedWindow> g_canvasNativeLayout;
++// Retain workspaces while their last window is on the canvas. Save a deep
++// copy of the dwindle tree, since floating targets destroys its live nodes.
++struct SSyspunkDwindle {
++    PHLWORKSPACE workspace;
++    std::vector<SP<Layout::Tiled::SDwindleNodeData>> nodes;
++};
++static std::unordered_map<int64_t, SSyspunkDwindle> g_syspunkDwindle;
++
++static void saveSyspunkDwindle(PHLWORKSPACE ws) {
++    if (!ws || !ws->m_space || g_syspunkDwindle.contains(ws->m_id)) return;
++    const auto algo = ws->m_space->algorithm();
++    auto* dwindle = algo ? dynamic_cast<Layout::Tiled::CDwindleAlgorithm*>(algo->tiledAlgo().get()) : nullptr;
++    if (!dwindle) return;
++    SSyspunkDwindle saved{.workspace = ws};
++    std::unordered_map<const Layout::Tiled::SDwindleNodeData*, SP<Layout::Tiled::SDwindleNodeData>> clones;
++    for (const auto& node : dwindle->m_dwindleNodesData) {
++        auto copy = makeShared<Layout::Tiled::SDwindleNodeData>(*node);
++        clones.emplace(node.get(), copy);
++        saved.nodes.push_back(copy);
++    }
++    const auto remap = [&clones](const WP<Layout::Tiled::SDwindleNodeData>& ref) -> WP<Layout::Tiled::SDwindleNodeData> {
++        const auto original = ref.lock();
++        const auto it = original ? clones.find(original.get()) : clones.end();
++        return it != clones.end() ? it->second : WP<Layout::Tiled::SDwindleNodeData>{};
++    };
++    for (const auto& copy : saved.nodes) {
++        copy->pParent = remap(copy->pParent);
++        copy->children[0] = remap(copy->children[0]);
++        copy->children[1] = remap(copy->children[1]);
++        copy->self = copy;
++    }
++    g_syspunkDwindle.emplace(ws->m_id, std::move(saved));
++}
++
++static void restoreSyspunkDwindle() {
++    for (auto& [id, saved] : g_syspunkDwindle) {
++        const auto ws = saved.workspace;
++        const auto algo = ws && ws->m_space ? ws->m_space->algorithm() : nullptr;
++        auto* dwindle = algo ? dynamic_cast<Layout::Tiled::CDwindleAlgorithm*>(algo->tiledAlgo().get()) : nullptr;
++        if (!dwindle) continue;
++        std::set<const Layout::ITarget*> before, now;
++        bool intact = true;
++        for (const auto& node : saved.nodes) {
++            if (node->isNode) continue;
++            const auto target = node->pTarget.lock();
++            if (!target || target->floating() || target->workspace() != ws) { intact = false; break; }
++            before.insert(target.get());
++        }
++        for (const auto& node : dwindle->m_dwindleNodesData)
++            if (!node->isNode && node->pTarget) now.insert(node->pTarget.get());
++        // Closed/new/grouped windows invalidate the saved tree. Hyprland's
++        // normal layout then supplies a valid tree for the new membership.
++        if (!intact || before != now) continue;
++        dwindle->m_dwindleNodesData = std::move(saved.nodes);
++        dwindle->recalculate();
++    }
++    g_syspunkDwindle.clear();
++}
+ static std::unordered_map<uint64_t, CBox> g_canvasSpatialLayout;
++static bool g_syspunkWorkspaceOnly = true;
++static PHLWORKSPACEREF g_syspunkWorkspace;
++static std::string g_syspunkScopeKey = "initial";
++static std::unordered_map<std::string, std::unordered_map<uint64_t, CBox>> g_syspunkLayouts;
++
++bool syspunkCanvasWorkspaceOnly() { return g_syspunkWorkspaceOnly; }
++bool syspunkCanvasCompatible(PHLWORKSPACE workspace, bool workspaceOnly) {
++    for (const auto& window : Desktop::windowState()->windows()) {
++        if (!validMapped(window) || !window->m_workspace || window->m_workspace->m_isSpecialWorkspace || window->m_pinned) continue;
++        if ((!workspaceOnly || window->m_workspace == workspace) && window->m_group) return false;
++    }
++    return true;
++}
++int64_t syspunkCanvasWorkspaceID() {
++    const auto ws = g_syspunkWorkspace.lock();
++    return g_syspunkWorkspaceOnly && ws ? ws->m_id : 0;
++}
++void syspunkCanvasPrepare(PHLWORKSPACE workspace, bool workspaceOnly) {
++    // Called only after native state has been restored. Keep each mode's
++    // spatial arrangement separately, including different workspaces.
++    g_syspunkLayouts[g_syspunkScopeKey] = std::move(g_canvasSpatialLayout);
++    g_syspunkWorkspaceOnly = workspaceOnly;
++    g_syspunkWorkspace = workspaceOnly ? workspace : PHLWORKSPACE{};
++    g_syspunkScopeKey = workspaceOnly && workspace ? std::format("workspace:{}", workspace->m_id) : "global";
++    g_canvasSpatialLayout = g_syspunkLayouts[g_syspunkScopeKey];
++}
++static std::string syspunkCameraKey(PHLMONITOR monitor) {
++    return monitor->m_name + ":" + g_syspunkScopeKey;
++}
+ static std::vector<std::vector<SCanvasSavedWindow>> g_canvasUndo;
+ static std::vector<std::vector<SCanvasSavedWindow>> g_canvasRedo;
+ static bool g_canvasRestoring = false;
++static int g_canvasWorkspaceMoveDepth = 0;
++static wl_event_source* g_canvasWorkspaceMoveIdle = nullptr;
++static std::unordered_set<uint64_t> g_canvasWorkspaceMoves;
+ static std::unordered_map<std::string, Vector2D> g_canvasCameraBookmarks;
++static std::unordered_map<std::string, float> g_syspunkZoomBookmarks;
+ static std::string g_canvasCursorShape; // the cursor override the canvases set; empty: none
+ static const CScrollOverview* g_linkedLeader = nullptr; // linked screens: whose camera the others take
+ static Time::steady_tp        g_linkedLeaderMovedAt;    // when the leader last moved its own camera
+@@ -177,7 +277,9 @@
+ void        canvasReleaseX11Windows();
+ 
+ static SCanvasSavedWindow saveCanvasWindow(PHLWINDOW w) {
+-    return {w, w->m_workspace, w->layoutTarget()->position(), w->layoutTarget()->floating(), Fullscreen::controller()->getFullscreenModes(w)};
++    const auto monitor = w->m_monitor.lock();
++    return {w, w->m_workspace, w->layoutTarget()->position(), w->layoutTarget()->floating(), Fullscreen::controller()->getFullscreenModes(w),
++            monitor, monitor ? monitor->logicalBox() : CBox{}};
+ }
+ 
+ // A window and its layout target can disagree about where they live: the
+@@ -211,36 +313,82 @@
+ // CWindow::moveToWorkspace alone leaves the layout target behind (see above);
+ // this is the path Hyprland's own movetoworkspace takes.
+ static void moveCanvasWindowToWorkspace(const PHLWINDOW& w, const PHLWORKSPACE& ws) {
++    struct SInternalMove {
++        SInternalMove() { ++g_canvasWorkspaceMoveDepth; }
++        ~SInternalMove() { --g_canvasWorkspaceMoveDepth; }
++    } internalMove;
+     if (w && valid(ws) && w->m_workspace != ws)
+         Desktop::globalWindowController()->moveWindowToWorkspace(w, ws);
+     attachCanvasLayoutTarget(w);
+ }
+ 
++static bool restoreCanvasNativeWindow(const PHLWINDOW& w, const SCanvasSavedWindow& saved) {
++    if (!validMapped(w) || !w->layoutTarget()) return false;
++    Fullscreen::controller()->setFullscreenMode(w, Fullscreen::FSMODE_NONE, Fullscreen::FSMODE_NONE);
++    if (const auto ws = saved.workspace.lock(); ws && w->m_workspace != ws) moveCanvasWindowToWorkspace(w, ws);
++    if (!setCanvasFloating(w, saved.floating)) return false;
++    if (saved.floating && w->layoutTarget()) {
++        auto box = saved.box;
++        const auto m = w->m_monitor.lock();
++        // Preserve deliberately oversized/off-screen floating geometry unless
++        // this output actually changed while the window was on the canvas.
++        if (m && (m != saved.monitor.lock() || m->logicalBox().pos() != saved.monitorBox.pos() || m->logicalBox().size() != saved.monitorBox.size())) {
++            box.w = std::min(box.w, m->m_size.x);
++            box.h = std::min(box.h, m->m_size.y);
++            box.x = std::clamp(box.x, m->m_position.x, m->m_position.x + m->m_size.x - box.w);
++            box.y = std::clamp(box.y, m->m_position.y, m->m_position.y + m->m_size.y - box.h);
++        }
++        w->layoutTarget()->rememberFloatingSize(box.size());
++        w->layoutTarget()->setPositionGlobal(box);
++        w->layoutTarget()->warpPositionSize();
++    }
++    Fullscreen::controller()->setFullscreenMode(w, saved.fullscreen.internal, saved.fullscreen.client);
++    return true;
++}
++
++static void cancelCanvasWorkspaceMoves() {
++    if (g_canvasWorkspaceMoveIdle) wl_event_source_remove(g_canvasWorkspaceMoveIdle);
++    g_canvasWorkspaceMoveIdle = nullptr;
++    g_canvasWorkspaceMoves.clear();
++}
++
++static void releaseCanvasWindowsOutsideScope(void*) {
++    g_canvasWorkspaceMoveIdle = nullptr;
++    const auto pending = std::exchange(g_canvasWorkspaceMoves, {});
++    g_canvasRestoring = true;
++    for (const auto id : pending) {
++        const auto it = g_canvasNativeLayout.find(id);
++        if (it == g_canvasNativeLayout.end()) continue;
++        const auto w = it->second.window.lock();
++        if (!validMapped(w) || !w->layoutTarget() || !w->m_workspace) continue;
++        if (!w->m_workspace->m_isSpecialWorkspace && !w->m_pinned &&
++            (!g_syspunkWorkspaceOnly || w->m_workspace == g_syspunkWorkspace.lock())) continue;
++        // Native moves finish updating their layout target after the event.
++        // Restore outside that traversal; keep failures for the normal exit.
++        g_canvasSpatialLayout[id] = w->layoutTarget()->position();
++        const auto target = w->layoutTarget().get();
++        if (restoreCanvasNativeWindow(w, it->second)) {
++            g_canvasManagedTargets.erase(target);
++            g_canvasNativeLayout.erase(id);
++        }
++    }
++    g_canvasRestoring = false;
++}
++
+ static void restoreCanvasNativeLayout() {
+-    if (g_canvasNativeLayout.empty()) return;
++    cancelCanvasWorkspaceMoves();
++    if (g_canvasNativeLayout.empty()) {
++        g_syspunkDwindle.clear();
++        return;
++    }
+     g_canvasRestoring = true;
+     for (auto& [id, saved] : g_canvasNativeLayout) {
+         const auto w = saved.window.lock();
+         if (!validMapped(w) || !w->layoutTarget()) continue;
+         g_canvasSpatialLayout[id] = w->layoutTarget()->position();
+-        Fullscreen::controller()->setFullscreenMode(w, Fullscreen::FSMODE_NONE, Fullscreen::FSMODE_NONE);
+-        if (const auto ws = saved.workspace.lock(); ws && w->m_workspace != ws) moveCanvasWindowToWorkspace(w, ws);
+-        if (!setCanvasFloating(w, saved.floating)) continue;
+-        if (saved.floating && w->layoutTarget()) {
+-            // Clamp recovery geometry to its current output if topology changed.
+-            auto box = saved.box;
+-            if (const auto m = w->m_monitor.lock()) {
+-                box.w = std::min(box.w, m->m_size.x);
+-                box.h = std::min(box.h, m->m_size.y);
+-                box.x = std::clamp(box.x, m->m_position.x, m->m_position.x + m->m_size.x - box.w);
+-                box.y = std::clamp(box.y, m->m_position.y, m->m_position.y + m->m_size.y - box.h);
+-            }
+-            w->layoutTarget()->rememberFloatingSize(box.size());
+-            w->layoutTarget()->setPositionGlobal(box);
+-            w->layoutTarget()->warpPositionSize();
+-        }
+-        Fullscreen::controller()->setFullscreenMode(w, saved.fullscreen.internal, saved.fullscreen.client);
+-    }
++        restoreCanvasNativeWindow(w, saved);
++    }
++    restoreSyspunkDwindle();
+     g_canvasNativeLayout.clear();
+     g_canvasManagedTargets.clear();
+     g_canvasRestoring = false;
+@@ -467,10 +615,13 @@
+ static bool shouldShowOverviewWindow(const PHLWINDOW& window) {
+     const auto WINDOW = getOverviewWindowToShow(window);
+ 
+-    if (!validMapped(WINDOW))
++    if (!validMapped(WINDOW) || g_canvasPendingWindows.contains(WINDOW->m_stableID))
+         return false;
+ 
+     if (WINDOW->m_workspace && WINDOW->m_workspace->m_isSpecialWorkspace)
++        return false;
++
++    if (g_syspunkWorkspaceOnly && g_syspunkWorkspace.lock() && WINDOW->m_workspace != g_syspunkWorkspace.lock())
+         return false;
+ 
+     if (WINDOW->m_pinned && WINDOW->m_isFloating)
+@@ -1425,6 +1576,7 @@
+ }
+ 
+ CScrollOverview::~CScrollOverview() {
++    clearPendingRegions();
+     if (g_pointerGrabOverview == this)
+         g_pointerGrabOverview = nullptr;
+     // A drag target this canvas picked is no longer drawn by it.
+@@ -1469,7 +1621,10 @@
+     images.clear(); // otherwise we get a vram leak
+     // Where the camera was heading: a canvas can close mid-glide (a window going
+     // fullscreen right after landing on it).
+-    if (isCanvasDesktop() && MONITOR) g_canvasCameraBookmarks[MONITOR->m_name] = viewOffset->goal();
++    if (isCanvasDesktop() && MONITOR) {
++        g_canvasCameraBookmarks[syspunkCameraKey(MONITOR)] = viewOffset->goal();
++        g_syspunkZoomBookmarks[syspunkCameraKey(MONITOR)] = scale->goal();
++    }
+     endNavigatorSessionIfIdle();
+     if (scrollOverviews().empty()) {
+         // Re-tiling while an output is being torn down trips the layout's
+@@ -1551,11 +1706,11 @@
+     Animation::mgr()->createAnimation(1.F, workspaceInsertProgress, overviewAnimationConfig, AVARDAMAGE_NONE);
+     Animation::mgr()->createAnimation(1.F, workspaceInsertFadeProgress, workspaceInsertFadeConfig, AVARDAMAGE_NONE);
+ 
+-    if (isCanvasDesktop() && pMonitor && g_canvasCameraBookmarks.contains(pMonitor->m_name))
+-        viewOffset->setValueAndWarp(g_canvasCameraBookmarks.at(pMonitor->m_name));
++    if (isCanvasDesktop() && pMonitor && g_canvasCameraBookmarks.contains(syspunkCameraKey(pMonitor.lock())))
++        viewOffset->setValueAndWarp(g_canvasCameraBookmarks.at(syspunkCameraKey(pMonitor.lock())));
+     else if (isCanvasDesktop() && pMonitor && ScrollOverview::Config::getCanvasRememberLayout()) {
+-        if (const auto CAMERA = SpatialOverview::Memory::camera(pMonitor->m_name))
+-            viewOffset->setValueAndWarp(*CAMERA);
++        if (const auto CAMERA = SpatialOverview::Memory::camera(pMonitor->m_name, g_syspunkScopeKey))
++            viewOffset->setValueAndWarp(CAMERA->offset);
+     }
+ 
+     scale->setUpdateCallback([this](auto) { damage(); });
+@@ -1566,8 +1721,18 @@
+ 
+     if (!swipe) {
+         *scale = isCanvasDesktop() ? (canvasNavigationActive ? ScrollOverview::Config::getCanvasInitialZoom() : 1.F) : ScrollOverview::Config::getScale();
+-        if (isCanvasDesktop())
++        if (isCanvasDesktop() && PMONITOR && g_syspunkZoomBookmarks.contains(syspunkCameraKey(PMONITOR)))
++            scale->setValueAndWarp(g_syspunkZoomBookmarks.at(syspunkCameraKey(PMONITOR)));
++        else if (isCanvasDesktop() && PMONITOR && ScrollOverview::Config::getCanvasRememberLayout()) {
++            if (const auto CAMERA = SpatialOverview::Memory::camera(PMONITOR->m_name, g_syspunkScopeKey))
++                scale->setValueAndWarp(std::clamp(CAMERA->zoom, ScrollOverview::Config::getCanvasMinZoom(), ScrollOverview::Config::getCanvasMaxZoom()));
++        }
++        if (isCanvasDesktop()) {
++            // A restored zoomed camera is already in navigation mode.
++            // Otherwise its next toggle treats the saved view as native 100%.
++            canvasNavigationActive = std::abs(scale->goal() - 1.F) > .001F;
+             *transitionProgress = canvasNavigationActive ? 1.F : 0.F;
++        }
+     }
+ 
+     const auto initialFullscreenWindow =
+@@ -1577,8 +1742,12 @@
+     lastMousePosLocal = getOverviewMousePosLocal(pMonitor.lock());
+ 
+     auto onMouseMove = [this](Vector2D, Event::SCallbackInfo& info) {
+-        if (sessionLocked())
++        if (info.cancelled || sessionLocked())
+             return;
++        if (handleCanvasPointerConstraint()) {
++            info.cancelled = true;
++            return;
++        }
+         const auto INPUTOVERVIEW = scrollOverviewAt(g_pInputManager->getMouseCoordsInternal());
+ 
+         // A drag the canvas does not own is Hyprland's, motion and all.
+@@ -1598,6 +1767,12 @@
+         const float    DRAGTHRESHOLDSQ       = std::pow(DRAGTHRESHOLD, 2);
+ 
+         lastMousePosLocal = getOverviewMousePosLocal(pMonitor.lock());
++        if (regionDrawing) {
++            updateSpawnRegion();
++            info.cancelled = true;
++            requestInputFrame();
++            return;
++        }
+         if (landingDrag) {
+             info.cancelled = true;
+             updateExperimentDrag();
+@@ -1679,7 +1854,7 @@
+                     // In the navigator, empty canvas is something you grab
+                     // and throw around, like a map.
+                     const auto WINDOW = windowAtOverviewPoint(dragStartMouseLocal);
+-                    if (!WINDOW && navigatorOwnsPointer())
++                    if (!WINDOW && isCanvasDesktop())
+                         beginScrollingPanAtPoint(dragStartMouseLocal);
+                     else
+                         beginWindowDrag(WINDOW);
+@@ -1785,6 +1960,16 @@
+             const uint32_t MAIN       = LEFT_HANDED ? BTN_RIGHT : BTN_LEFT;
+             const uint32_t SECONDARY  = BTN_MIDDLE;
+             const auto MODS           = g_pInputManager->getModsFromAllKBs();
++            if (event.state == WL_POINTER_BUTTON_STATE_PRESSED) stopCanvasMotion();
++            if (event.state == WL_POINTER_BUTTON_STATE_RELEASED && navigatorSwallowedButtons.erase(event.button)) {
++                info.cancelled = true;
++                return;
++            }
++
++            if (handleRegionButton(event.button, event.state)) {
++                info.cancelled = true;
++                return;
++            }
+             const bool WINDOWGESTURE  = MODS & (HL_MODIFIER_META | HL_MODIFIER_ALT);
+ 
+             const auto MONITOR = pMonitor.lock();
+@@ -1825,10 +2010,6 @@
+                 return;
+             }
+ 
+-            if (event.state == WL_POINTER_BUTTON_STATE_RELEASED && navigatorSwallowedButtons.erase(event.button)) {
+-                info.cancelled = true;
+-                return;
+-            }
+ 
+             if (event.button == MAIN && event.state == WL_POINTER_BUTTON_STATE_PRESSED && showsNavigatorHud()) {
+                 PHLWINDOW ROWWINDOW;
+@@ -2118,8 +2299,8 @@
+             const auto MODS      = g_pInputManager->getModsFromAllKBs();
+             const bool NAVIGATOR = navigatorOwnsPointer();
+             const bool WHEEL     = e.source == WL_POINTER_AXIS_SOURCE_WHEEL || e.source == WL_POINTER_AXIS_SOURCE_WHEEL_TILT;
+-            const bool ZOOM      = (MODS & HL_MODIFIER_CTRL) || (NAVIGATOR && WHEEL);
+-            if (ZOOM && (!isPersistentCanvas() || canvasNavigationActive) && e.axis == WL_POINTER_AXIS_VERTICAL_SCROLL && e.delta != 0.0) {
++            const bool ZOOM      = (MODS & (HL_MODIFIER_CTRL | HL_MODIFIER_META)) || (WHEEL && (NAVIGATOR || !canvasDesktopWindowAtPoint(getOverviewMousePosLocal(pMonitor.lock()))));
++            if (ZOOM && e.axis == WL_POINTER_AXIS_VERTICAL_SCROLL && e.delta != 0.0) {
+                 const float DIRECTION = e.delta > 0.0 ? -1.F : 1.F;
+                 const float FACTOR    = std::exp(DIRECTION * ScrollOverview::Config::getCanvasZoomStep());
+                 zoomCanvasAt(getOverviewMousePosLocal(pMonitor.lock()), scale->value() * FACTOR);
+@@ -2182,11 +2363,15 @@
+             return;
+ 
+         if (isCanvasDesktop() && window && window->m_monitor == pMonitor) {
++            if (!isScreensaverWindow(window) && queueCanvasWindow(window)) {
++                rebuildPending = true; damage(); return;
++            }
+             if (!isScreensaverWindow(window) && !Fullscreen::controller()->isFullscreen(window)) {
+                 manageCanvasWindow(window, true);
++                const bool REGION = applySpawnRegion(window);
+                 // During a DnD (e.g. Chromium/Vivaldi tab drag creates its new
+                 // toplevel mid-drag) do not fly the camera to the new window.
+-                if (!canvasCompositorDndActive())
++                if (!REGION && !canvasCompositorDndActive())
+                     followCanvasWindow(window, false);
+                 noteCanvasLayoutChanged();
+             }
+@@ -2204,6 +2389,11 @@
+             return;
+ 
+         if (window) {
++            const bool wasPending = g_canvasPendingWindows.contains(window->m_stableID);
++            forgetPendingRegion(window);
++            g_canvasCaptureBlocked.erase(window->m_stableID);
++            if (!wasPending && g_canvasNativeLayout.contains(window->m_stableID) && window->layoutTarget() && ScrollOverview::Config::getCanvasRememberLayout())
++                SpatialOverview::Memory::save({{window, window->layoutTarget()->position()}}, {}, g_syspunkScopeKey);
+             g_canvasNativeLayout.erase(window->m_stableID);
+             g_canvasSpatialLayout.erase(window->m_stableID);
+             if (window->layoutTarget()) g_canvasManagedTargets.erase(window->layoutTarget().get());
+@@ -2215,10 +2405,20 @@
+         damage();
+     };
+ 
+-    auto onWindowMove = [this](PHLWINDOW, PHLWORKSPACE) {
++    auto onWindowMove = [this](PHLWINDOW window, PHLWORKSPACE workspace) {
+         if (closing)
+             return;
+ 
++        if (isCanvasDesktop() && !g_canvasRestoring && !g_canvasWorkspaceMoveDepth && window && workspace) {
++            if (workspace->m_isSpecialWorkspace || (g_syspunkWorkspaceOnly && workspace != g_syspunkWorkspace.lock())) forgetPendingRegion(window);
++            const auto it = g_canvasNativeLayout.find(window->m_stableID);
++            if (it != g_canvasNativeLayout.end()) {
++                it->second.workspace = workspace;
++                g_canvasWorkspaceMoves.insert(window->m_stableID);
++                if (!g_canvasWorkspaceMoveIdle)
++                    g_canvasWorkspaceMoveIdle = wl_event_loop_add_idle(g_pCompositor->m_wlEventLoop, releaseCanvasWindowsOutsideScope, nullptr);
++            }
++        }
+         rebuildPending = true;
+         damage();
+     };
+@@ -2329,6 +2529,14 @@
+ 
+         if (isTopLayerFocused(pMonitor.lock()))
+             return;
++
++        if (KEYSYM == XKB_KEY_Escape && event.state == WL_KEYBOARD_KEY_STATE_PRESSED &&
++            (regionArmed || spawnRegion || panCoast.active || windowCoast.active)) {
++            cancelSpawnRegion(); stopCanvasMotion();
++            SpatialOverview::Navigator::markConsumed(event.keycode);
++            info.cancelled = true;
++            return;
++        }
+ 
+         // A panel can disappear while the seat still references its now-
+         // unmapped layer surface. Reconcile that split before Hyprland forwards
+@@ -2394,7 +2602,7 @@
+     auto onPinchBegin = [this](IPointer::SPinchBeginEvent, Event::SCallbackInfo& info) {
+         if (sessionLocked())
+             return;
+-        if (closing || !isCanvasDesktop() || (isPersistentCanvas() && !canvasNavigationActive) ||
++        if (closing || !isCanvasDesktop() ||
+             scrollOverviewAt(g_pInputManager->getMouseCoordsInternal()).get() != this)
+             return;
+ 
+@@ -2897,6 +3105,8 @@
+ 
+         if (WORKSPACE == REMOVEDWORKSPACE)
+             continue;
++        if (isCanvasDesktop() && g_syspunkWorkspaceOnly && g_syspunkWorkspace.lock() && WORKSPACE != g_syspunkWorkspace.lock())
++            continue;
+ 
+         images.emplace_back(makeShared<SWorkspaceImage>(WORKSPACE));
+     }
+@@ -3490,6 +3700,7 @@
+ }
+ 
+ void CScrollOverview::toggleCanvasNavigation() {
++    stopCanvasMotion();
+     syncAnimationConfig();
+     const auto MONITOR = pMonitor.lock();
+     if (!isPersistentCanvas() || !MONITOR || closing)
+@@ -3935,6 +4146,7 @@
+         window->m_monitor = monitor;
+         Fullscreen::controller()->setFullscreenMode(window, MODES.internal, MODES.client);
+     }
++    saveCanvasMemory(nullptr);
+     g_canvasFullscreen.push_back({.window = window, .monitor = monitor, .before = before, .savedCamera = canvas->restingCameraOffset()});
+     removeOverview(canvas);
+     g_canvasFullscreenApplying = false;
+@@ -4040,15 +4252,12 @@
+ 
+     auto pending = std::move(g_canvasFullscreenPending);
+     g_canvasFullscreenPending.clear();
+-    // Going fullscreen from the zoomed-out view: every screen returns to 100%
+-    // (the window grows out of where it was drawn), so no screen is left
+-    // zoomed out beside it.
+-    if (!pending.empty())
+-        leaveNavigationEverywhere();
++    // Stepping aside must preserve each camera. Its destructor bookmarks the
++    // current goal, and reopening restores that exact view and zoom.
+     for (const auto& request : pending) {
+         const auto WINDOW  = request.window.lock();
+         const auto MONITOR = request.monitor.lock();
+-        if (validMapped(WINDOW) && MONITOR && Fullscreen::controller()->isFullscreen(WINDOW) && !canvasFullscreenWindow(WINDOW))
++        if (validMapped(WINDOW) && MONITOR && !g_canvasPendingWindows.contains(WINDOW->m_stableID) && Fullscreen::controller()->isFullscreen(WINDOW) && !canvasFullscreenWindow(WINDOW))
+             canvasFullscreenStepAside(WINDOW, MONITOR);
+     }
+ 
+@@ -4078,9 +4287,8 @@
+             continue;
+         const auto OWNER  = CONSTRAINT->owner();
+         const auto WINDOW = OWNER && OWNER->view() ? Desktop::View::CWindow::fromView(OWNER->view()) : nullptr;
+-        if (WINDOW && !shouldShowOverviewWindow(WINDOW))
+-            continue;
+-        CONSTRAINT->deactivate();
++        if (WINDOW && g_canvasCaptureBlocked.contains(WINDOW->m_stableID))
++            CONSTRAINT->deactivate();
+     }
+ }
+ 
+@@ -4113,6 +4321,10 @@
+ 
+ // Pointer moves, from main.cpp's listener; true: the move is undone.
+ bool canvasPointerMoved() {
++    for (const auto& overview : scrollOverviews()) {
++        auto* canvas = canvasOf(overview);
++        if (canvas && canvas->handleCanvasPointerConstraint()) return true;
++    }
+     if (canvasKeepPointerOnFullscreen())
+         return true;
+     canvasFollowMouseOntoFullscreen();
+@@ -4197,6 +4409,10 @@
+     if (g_canvasFullscreenApplying || g_canvasRestoring)
+         return;
+     window = getOverviewWindowToShow(window);
++    if (window && g_canvasPendingWindows.contains(window->m_stableID)) {
++        Fullscreen::controller()->setFullscreenMode(window, Fullscreen::FSMODE_NONE, Fullscreen::FSMODE_NONE);
++        return;
++    }
+     if (window && Fullscreen::controller()->isFullscreen(window) && shouldShowOverviewWindow(window)) {
+         if (const auto MONITOR = canvasScreenOf(window))
+             g_canvasFullscreenPending.push_back({window, MONITOR});
+@@ -4220,6 +4436,23 @@
+     g_canvasWindowedBox.clear();
+ }
+ 
++bool syspunkCanvasActive() {
++    return !g_canvasFullscreen.empty() || !scrollOverviews().empty();
++}
++void syspunkCanvasStop() {
++    saveCanvasMemory(nullptr);
++    // A dispatcher calls this outside render traversal. Clearing the owner
++    // list first lets destructors restore native state exactly once.
++    canvasFullscreenReset();
++    clearScrollOverviews();
++    restoreCanvasNativeLayout(); // fullscreen may have temporarily removed all cameras
++    canvasReleaseX11Windows();
++    restoreActiveWorkspaceVisibility();
++    Pointer::Cursor::overrideController->unsetOverride(Pointer::Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
++    g_canvasCursorShape.clear();
++    g_canvasManualCapture.reset();
++}
++
+ // ---- State for scripts and tests (hyprctl spatialoverview) --------------------------
+ static std::string jsonString(const std::string& text) {
+     std::string out = "\"";
+@@ -4244,9 +4477,9 @@
+         if (!MONITOR)
+             continue;
+         const auto CAMERA = CANVAS->canvasScreenToWorld(MONITOR->logicalBox());
+-        screens += std::format("{}{{\"monitor\": {}, \"zoom\": {:.3f}, \"navigating\": {}, \"closing\": {}, \"view\": [{:.0f}, {:.0f}, {:.0f}, {:.0f}]}}", screens.empty() ? "" : ", ",
++        screens += std::format("{}{{\"monitor\": {}, \"zoom\": {:.3f}, \"navigating\": {}, \"closing\": {}, \"view\": [{:.0f}, {:.0f}, {:.0f}, {:.0f}], \"mechanics\": {}}}", screens.empty() ? "" : ", ",
+                                jsonString(MONITOR->m_name), CANVAS->canvasZoom(), CANVAS->isCanvasNavigationActive() ? "true" : "false", CANVAS->isClosing() ? "true" : "false",
+-                               CAMERA ? CAMERA->x : 0.0, CAMERA ? CAMERA->y : 0.0, CAMERA ? CAMERA->width : 0.0, CAMERA ? CAMERA->height : 0.0);
++                               CAMERA ? CAMERA->x : 0.0, CAMERA ? CAMERA->y : 0.0, CAMERA ? CAMERA->width : 0.0, CAMERA ? CAMERA->height : 0.0, CANVAS->mechanicsStateJson());
+     }
+     for (const auto& entry : g_canvasFullscreen) {
+         const auto WINDOW  = entry.window.lock();
+@@ -4528,6 +4761,9 @@
+ }
+ 
+ void CScrollOverview::zoomCanvasAt(const Vector2D& point, float requestedZoom, bool animate) {
++    stopCanvasMotion();
++    if (animate)
++        syncAnimationConfig();
+     const auto MONITOR = pMonitor.lock();
+     if (!isCanvasDesktop() || !MONITOR)
+         return;
+@@ -4551,6 +4787,7 @@
+     }
+ 
+     markBlurDirty();
++    noteCanvasLayoutChanged();
+     damage();
+ }
+ 
+@@ -4570,6 +4807,7 @@
+ }
+ 
+ bool CScrollOverview::followCanvasWindow(PHLWINDOW window, bool syncFocus, bool animate) {
++    stopCanvasMotion();
+     if (animate)
+         syncAnimationConfig();
+     window = getOverviewWindowToShow(window);
+@@ -4605,6 +4843,7 @@
+     if (Desktop::focusState()->window() == window)
+         ensureCanvasKeyboardFocus(window);
+     markBlurDirty();
++    noteCanvasLayoutChanged();
+     damage();
+     return true;
+ }
+@@ -4619,6 +4858,7 @@
+         return false;
+ 
+     if (window->m_workspace && window->m_workspace->m_isSpecialWorkspace) return false;
++    saveSyspunkDwindle(window->m_workspace);
+     if (!g_canvasNativeLayout.contains(window->m_stableID))
+         g_canvasNativeLayout.emplace(window->m_stableID, saveCanvasWindow(window));
+ 
+@@ -4641,7 +4881,7 @@
+         return true;
+     }
+     if (placeNew && ScrollOverview::Config::getCanvasRememberLayout()) {
+-        if (const auto HOME = SpatialOverview::Memory::claim(window, Time::steadyNow() < g_canvasMemoryRestoreUntil)) {
++        if (const auto HOME = SpatialOverview::Memory::claim(window, Time::steadyNow() < g_canvasMemoryRestoreUntil, g_syspunkScopeKey)) {
+             TARGET->rememberFloatingSize(HOME->size());
+             TARGET->setPositionGlobal(*HOME);
+             TARGET->warpPositionSize();
+@@ -5046,6 +5286,11 @@
+     if (!isCanvasDesktop() || !ScrollOverview::Config::getCanvasDirectInput() || spacePanHeld || scrollingPanPointerDown || dragActiveWindow || resizeActiveWindow || canvasCompositorDndActive())
+         return;
+ 
++    // Buttons and axes refresh pointer focus through this path as well.
++    // A locked game must not receive an absolute recenter before a click.
++    if (handleCanvasPointerConstraint())
++        return;
++
+     CBox       BOX;
+     Vector2D   WINDOWLOCAL;
+     Vector2D   SURFACELOCAL;
+@@ -5137,6 +5382,11 @@
+         return false;
+ 
+     if (event.state == WL_POINTER_BUTTON_STATE_PRESSED) {
++        const bool wasBlocked = g_canvasCaptureBlocked.erase(WINDOW->m_stableID);
++        if (wasBlocked && WINDOW->wlSurface()) {
++            if (const auto constraint = WINDOW->wlSurface()->constraint(); constraint && !constraint->isActive()) constraint->activate();
++        }
++        if (!navigatorOwnsPointer()) setCanvasCursor("");
+         canvasForwardedPointerButtons.emplace(event.button);
+         size_t workspaceIdx = viewportCurrentWorkspace;
+         for (size_t i = 0; i < images.size(); ++i) {
+@@ -5408,7 +5658,7 @@
+     box.x = lastMousePosLocal.x - dragGrabOffsetLocal.x;
+     box.y = lastMousePosLocal.y - dragGrabOffsetLocal.y;
+ 
+-    return box;
++    return magnetLocalBox(box, WINDOW);
+ }
+ 
+ CBox CScrollOverview::draggedWindowBoxFor(PHLWINDOW window, size_t workspaceIdx, const Vector2D& pointLocal, const Vector2D& grabRatio) const {
+@@ -5421,7 +5671,7 @@
+     auto       box             = getOverviewDragWindowBox(window, MONITOR, scale->value(), viewOffset->value(), WORKSPACEOFFSET, layout);
+     box.x = pointLocal.x - box.width * std::clamp(grabRatio.x, 0.0, 1.0);
+     box.y = pointLocal.y - box.height * std::clamp(grabRatio.y, 0.0, 1.0);
+-    return box;
++    return magnetLocalBox(box, window);
+ }
+ 
+ CBox CScrollOverview::draggedWindowGlobalBox() const {
+@@ -5434,6 +5684,12 @@
+     if (WORKSPACEIDX >= images.size())
+         return {};
+ 
++    if (isCanvasDesktop()) {
++        auto box = draggedWindowBox(WORKSPACEIDX);
++        box.scale(1.F / std::max(MONITOR->m_scale, .01F));
++        box.translate(MONITOR->m_position);
++        return box;
++    }
+     const auto WORKSPACEOFFSET =
+         workspaceOverviewOffset(WORKSPACEIDX, activeWorkspaceIndex(), getWorkspaceRenderedPitch(MONITOR, scale->value(), layout));
+     const auto SOURCEBOX =
+@@ -5504,6 +5760,7 @@
+     }
+ 
+     auto box = resizedOverviewBoxFromCorner(resizeOriginalBox, DELTA, resizeCorner, minSizePx, maxSizePx);
++    box = magnetLocalBox(box, WINDOW, true);
+ 
+     const auto WORKSPACEOFFSET = workspaceOverviewOffset(resizeWorkspaceIdx, activeWorkspaceIndex(), getWorkspaceRenderedPitch(MONITOR, scale->value(), layout));
+     const auto WORKSPACEBOX = getOverviewWorkspaceBox(MONITOR, scale->value(), viewOffset->value(), WORKSPACEOFFSET, layout);
+@@ -5571,6 +5828,7 @@
+ }
+ 
+ void CScrollOverview::beginWindowDrag(PHLWINDOW window) {
++    beginMotionSample(false);
+     checkpointCanvas();
+     const auto WINDOW = getOverviewWindowToShow(window);
+     if (!shouldShowOverviewWindow(WINDOW) || !WINDOW->layoutTarget())
+@@ -5631,6 +5889,7 @@
+ }
+ 
+ void CScrollOverview::beginWindowResize() {
++    stopCanvasMotion(); magnetX.reset(); magnetY.reset();
+     checkpointCanvas();
+     const auto WINDOW  = getOverviewWindowToShow(resizePendingWindow.lock());
+     const auto MONITOR = pMonitor.lock();
+@@ -5657,6 +5916,7 @@
+ }
+ 
+ void CScrollOverview::updateWindowDrag() {
++    sampleWindowMotion();
+     if (!dragActiveWindow)
+         return;
+ 
+@@ -5729,6 +5989,7 @@
+         const auto SAFEFACTOR = std::max(scale->value(), 0.01F) * std::max(MONITOR->m_scale, 0.01F);
+         const auto DELTAGLOBAL = DELTALOCAL * (ScrollOverview::Config::getPanSensitivity() / SAFEFACTOR);
+         viewOffset->setValueAndWarp(viewOffset->value() - DELTAGLOBAL);
++        panSamples.add(mechanicsTime(), {viewOffset->value().x, viewOffset->value().y});
+         scrollingPanLastMouseLocal = lastMousePosLocal;
+         markBlurDirty();
+         damage();
+@@ -5758,6 +6019,7 @@
+ }
+ 
+ void CScrollOverview::beginScrollingPan(PHLWORKSPACE workspace) {
++    beginMotionSample(true);
+     const auto ALGO = overviewScrollingAlgorithmForWorkspace(workspace);
+     if (!ALGO && layout != ScrollOverview::Config::ELayout::GRID)
+         return;
+@@ -5798,6 +6060,11 @@
+     if (WORKSPACE)
+         focusMostVisibleScrollingWindow(WORKSPACE);
+     scrollingPanInitialWindow.reset();
++    if (!WORKSPACE && isCanvasDesktop() && ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:inertia_enabled")) {
++        panCoast.start(panSamples.release(mechanicsTime(), canvasZoom()), mechanicsTime());
++        requestInputFrame(); damage();
++    }
++    noteCanvasLayoutChanged();
+ }
+ 
+ void CScrollOverview::updateViewportWorkspaceFromCanvasCenter() {
+@@ -6293,6 +6560,7 @@
+         g_pseudoFocusUntil    = Time::steadyNow() + POST_DROP_PSEUDO_FOCUS_DURATION;
+     }
+ 
++    releaseWindowMotion(WINDOW);
+     clearDragPending();
+     rebuildPending = true;
+     noteCanvasLayoutChanged();
+@@ -7652,7 +7920,7 @@
+     // With the navigator the minimap wears the HUD's colors; otherwise the
+     // theme's borders.
+     const bool NAVIGATOR        = ScrollOverview::Config::getNavigatorEnabled();
+-    const auto ACTIVEGRADIENT   = NAVIGATOR ? Config::CGradientValueData{SpatialOverview::Hud::theme().accent} : gradientFor("general:col.active_border", Colors::WHITE);
++    const auto ACTIVEGRADIENT   = NAVIGATOR ? Config::CGradientValueData{SpatialOverview::Hud::theme().accent} : ScrollOverview::Config::getCanvasAccent();
+     const auto INACTIVEGRADIENT = NAVIGATOR ? Config::CGradientValueData{CHyprColor{0.5F, 0.5F, 0.51F, 1.F}} :
+                                               gradientFor("general:col.inactive_border", CHyprColor{0.45F, 0.48F, 0.55F, 1.F});
+     CHyprColor activeColor      = ACTIVEGRADIENT.m_colors.empty() ? Colors::WHITE : ACTIVEGRADIENT.m_colors.front();
+@@ -7690,11 +7958,15 @@
+     if (SpatialOverview::BarrelShader::updateMinimap(shaderMinimap))
+         return;
+ 
++    const auto PANELCOLOR = ScrollOverview::Config::getCanvasPanelColor();
++    const auto ROUNDING = std::max(0, ScrollOverview::Config::getValue<int>("decoration:rounding"));
++    const auto ROUNDINGPOWER = ScrollOverview::Config::getValue<float>("decoration:rounding_power");
++    const auto BORDERWIDTH = std::max(1, ScrollOverview::Config::getValue<int>("general:border_size"));
+     CRectPassElement::SRectData background;
+     background.box           = PANEL.copy().round();
+-    background.color         = CHyprColor{0.025F, 0.03F, 0.045F, ScrollOverview::Config::getCanvasMinimapOpacity() * TRANSITION};
+-    background.round         = sc<int>(std::round(14.F * MONITORSCALE));
+-    background.roundingPower = 2.F;
++    background.color         = CHyprColor{PANELCOLOR.r, PANELCOLOR.g, PANELCOLOR.b, PANELCOLOR.a * ScrollOverview::Config::getCanvasMinimapOpacity() * TRANSITION};
++    background.round         = sc<int>(std::round(ROUNDING * MONITORSCALE));
++    background.roundingPower = ROUNDINGPOWER;
+     g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(background));
+ 
+     visited.clear();
+@@ -7708,8 +7980,8 @@
+         CRectPassElement::SRectData marker;
+         marker.box           = mapWorldBox(WINDOW->geometricBox(Desktop::View::IGeometric::GEOMETRIC_CURRENT));
+         marker.color         = color;
+-        marker.round         = sc<int>(std::round(3.F * MONITORSCALE));
+-        marker.roundingPower = 2.F;
++        marker.round         = sc<int>(std::round(std::min(ROUNDING, 3) * MONITORSCALE));
++        marker.roundingPower = ROUNDINGPOWER;
+         g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(marker));
+     }
+ 
+@@ -7718,47 +7990,47 @@
+     CRectPassElement::SRectData viewportFill;
+     viewportFill.box           = mapWorldBox(VIEWPORTWORLD);
+     viewportFill.color         = viewportColor;
+-    viewportFill.round         = sc<int>(std::round(5.F * MONITORSCALE));
+-    viewportFill.roundingPower = 2.F;
++    viewportFill.round         = sc<int>(std::round(std::min(ROUNDING, 5) * MONITORSCALE));
++    viewportFill.roundingPower = ROUNDINGPOWER;
+     g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(viewportFill));
+ 
+     CBorderPassElement::SBorderData viewportBorder;
+     viewportBorder.box           = viewportFill.box;
+     viewportBorder.grad1         = ACTIVEGRADIENT;
+     viewportBorder.a             = 0.95F * TRANSITION;
+-    viewportBorder.borderSize    = sc<int>(std::round(2.F * MONITORSCALE));
++    viewportBorder.borderSize    = sc<int>(std::round(BORDERWIDTH * MONITORSCALE));
+     viewportBorder.round         = viewportFill.round;
+     viewportBorder.outerRound    = viewportFill.round;
+-    viewportBorder.roundingPower = 2.F;
++    viewportBorder.roundingPower = ROUNDINGPOWER;
+     g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(viewportBorder));
+ 
+     CBorderPassElement::SBorderData panelBorder;
+     panelBorder.box           = PANEL.copy().round();
+     panelBorder.grad1         = INACTIVEGRADIENT;
+     panelBorder.a             = 0.5F * TRANSITION;
+-    panelBorder.borderSize    = std::max(1, sc<int>(std::round(MONITORSCALE)));
++    panelBorder.borderSize    = std::max(1, sc<int>(std::round(BORDERWIDTH * MONITORSCALE)));
+     panelBorder.round         = background.round;
+     panelBorder.outerRound    = background.round;
+-    panelBorder.roundingPower = 2.F;
++    panelBorder.roundingPower = ROUNDINGPOWER;
+     g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(panelBorder));
+ 
+     const auto ARRANGEBUTTON = canvasArrangeButtonBox();
+     if (!ARRANGEBUTTON.empty()) {
+         CRectPassElement::SRectData buttonBackground;
+         buttonBackground.box           = ARRANGEBUTTON;
+-        buttonBackground.color         = CHyprColor{0.025F, 0.03F, 0.045F, ScrollOverview::Config::getCanvasMinimapOpacity() * TRANSITION};
+-        buttonBackground.round         = sc<int>(std::round(10.F * MONITORSCALE));
+-        buttonBackground.roundingPower = 2.F;
++        buttonBackground.color         = CHyprColor{PANELCOLOR.r, PANELCOLOR.g, PANELCOLOR.b, PANELCOLOR.a * ScrollOverview::Config::getCanvasMinimapOpacity() * TRANSITION};
++        buttonBackground.round         = sc<int>(std::round(ROUNDING * MONITORSCALE));
++        buttonBackground.roundingPower = ROUNDINGPOWER;
+         g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(buttonBackground));
+ 
+         CBorderPassElement::SBorderData buttonBorder;
+         buttonBorder.box           = ARRANGEBUTTON;
+         buttonBorder.grad1         = INACTIVEGRADIENT;
+         buttonBorder.a             = 0.65F * TRANSITION;
+-        buttonBorder.borderSize    = std::max(1, sc<int>(std::round(MONITORSCALE)));
++        buttonBorder.borderSize    = std::max(1, sc<int>(std::round(BORDERWIDTH * MONITORSCALE)));
+         buttonBorder.round         = buttonBackground.round;
+         buttonBorder.outerRound    = buttonBackground.round;
+-        buttonBorder.roundingPower = 2.F;
++        buttonBorder.roundingPower = ROUNDINGPOWER;
+         g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(buttonBorder));
+ 
+         const float INSET = ARRANGEBUTTON.width * 0.23F;
+@@ -7779,7 +8051,7 @@
+                 }.round();
+                 cell.color         = iconColor;
+                 cell.round         = std::max(1, sc<int>(std::round(1.5F * MONITORSCALE)));
+-                cell.roundingPower = 2.F;
++                cell.roundingPower = ROUNDINGPOWER;
+                 g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(cell));
+             }
+         }
+@@ -8059,6 +8331,7 @@
+         .cameraTransform      = isCanvasDesktop() && !dragged,
+         .pseudoFocusWindow    = PSEUDOFOCUSWINDOW,
+     });
++    renderDoubleBorder(monitor, window, windowBox, renderScale);
+ }
+ 
+ void CScrollOverview::redrawAll(bool forcelowres) {
+@@ -9021,6 +9294,12 @@
+     if (pMonitor)
+         pMonitor->m_solitaryClient.reset();
+ 
++    if (sessionLocked() || canvasCompositorDndActive()) {
++        stopCanvasMotion();
++        if (pendingRegions.empty()) resetSpawnRegion();
++        else if (regionDrawing) { regionDrawing=false; spawnRegion.reset(); }
++    }
++    else advanceCanvasMotion();
+     followLinkedCamera();
+     syncCanvasWindowScreens();
+ 
+@@ -9211,6 +9490,7 @@
+         renderCanvasDesktopScene(MONITOR, SCALE, NOW);
+         renderNavigatorReticle(MONITOR, NOW);
+         renderDraggedWindow(MONITOR, ACTIVEIDX, PITCH, SCALE, NOW);
++        renderCanvasMechanics(MONITOR);
+         renderExperimentChrome(MONITOR);
+         renderCanvasViewport(MONITOR, SCALE);
+         renderCanvasMinimap(MONITOR);
+@@ -9304,6 +9584,7 @@
+ }
+ 
+ void CScrollOverview::setClosing(bool closing_) {
++    if (closing_) saveCanvasMemory(nullptr);
+     closing = closing_;
+     if (closing) {
+         transferSharedStateOwnership();
+@@ -9591,25 +9872,32 @@
+     for (const auto& windowRef : Desktop::windowState()->windows()) {
+         const auto WINDOW = getOverviewWindowToShow(windowRef);
+         if (!shouldShowOverviewWindow(WINDOW) || WINDOW->m_pinned || !WINDOW->layoutTarget() || !WINDOW->layoutTarget()->floating() ||
+-            !visited.emplace(WINDOW.get()).second)
++            !g_canvasNativeLayout.contains(WINDOW->m_stableID) || !visited.emplace(WINDOW.get()).second)
+             continue;
+-        placements.push_back({.window = WINDOW, .box = WINDOW->layoutTarget()->position()});
+-    }
+-
+-    // Cameras are remembered where they rest at 100%, not mid-flight or zoomed out.
+-    std::unordered_map<std::string, Vector2D> cameras;
++        auto box = WINDOW->layoutTarget()->position();
++        if (Fullscreen::controller()->isFullscreen(WINDOW)) {
++            const auto saved = g_canvasWindowedBox.find(WINDOW.get());
++            if (saved == g_canvasWindowedBox.end()) continue;
++            box = saved->second.box;
++        }
++        placements.push_back({.window = WINDOW, .box = box});
++    }
++
++    // Save the camera as seen, including zoom, independently for each scope.
++    std::unordered_map<std::string, SpatialOverview::Memory::SCamera> cameras;
+     for (const auto& overview : scrollOverviews()) {
+         const auto* canvas  = canvasOf(overview);
+         const auto  MONITOR = overview ? overview->pMonitor.lock() : PHLMONITOR{};
+         if (!canvas || !MONITOR || !canvas->isCanvasDesktop() || canvas->isClosing())
+             continue;
+-        cameras[MONITOR->m_name] = canvas->isCanvasNavigationActive() && canvas->hasNavigationReturn ? canvas->navigationReturnOffset : canvas->restingCameraOffset();
+-    }
+-    SpatialOverview::Memory::save(placements, cameras);
++        cameras[MONITOR->m_name] = {canvas->restingCameraOffset(), canvas->restingCameraZoom()};
++    }
++    SpatialOverview::Memory::save(placements, cameras, g_syspunkScopeKey);
+     return 0;
+ }
+ 
+ void disarmCanvasTimers() {
++    cancelCanvasWorkspaceMoves();
+     disarmCanvasSwitcher();
+     if (g_popupFadeTimer)
+         wl_event_source_remove(g_popupFadeTimer);
+@@ -9630,6 +9918,10 @@
+         wl_event_source_timer_update(g_canvasMemoryTimer, 600);
+ }
+ 
++float CScrollOverview::restingCameraZoom() const {
++    return scale ? scale->goal() : 1.F;
++}
++
+ Vector2D CScrollOverview::restingCameraOffset() const {
+     return viewOffset ? viewOffset->goal() : Vector2D{};
+ }
+@@ -9638,6 +9930,7 @@
+     if (viewOffset) {
+         viewOffset->setValueAndWarp(offset);
+         *viewOffset = offset;
++        noteCanvasLayoutChanged();
+     }
+ }
+ 
+@@ -9949,6 +10242,8 @@
+ }
+ 
+ void CScrollOverview::fitAllWindows() {
++    stopCanvasMotion();
++    syncAnimationConfig();
+     const auto MONITOR = pMonitor.lock();
+     if (!isCanvasDesktop() || !MONITOR || closing)
+         return;
+@@ -9987,10 +10282,13 @@
+     *viewOffset = target - MONITOR->m_position - MONITOR->m_size * 0.5F;
+     *scale      = ZOOM;
+     markBlurDirty();
++    noteCanvasLayoutChanged();
+     damage();
+ }
+ 
+ void CScrollOverview::panCamera(const Vector2D& direction) {
++    stopCanvasMotion();
++    syncAnimationConfig();
+     const auto MONITOR = pMonitor.lock();
+     if (!isCanvasDesktop() || !MONITOR)
+         return;
+@@ -9998,16 +10296,20 @@
+     *viewOffset      = viewOffset->goal() + Vector2D{direction.x * MONITOR->m_size.x, direction.y * MONITOR->m_size.y} * (0.22F / ZOOM);
+     markCanvasCameraActive(MONITOR);
+     markBlurDirty();
++    noteCanvasLayoutChanged();
+     damage();
+ }
+ 
+ void CScrollOverview::zoomCameraBy(float factor) {
++    stopCanvasMotion();
++    syncAnimationConfig();
+     const auto MONITOR = pMonitor.lock();
+     if (!isCanvasDesktop() || !MONITOR)
+         return;
+     const float ZOOM = std::clamp(scale->goal() * factor, ScrollOverview::Config::getCanvasMinZoom(), ScrollOverview::Config::getCanvasMaxZoom());
+     *scale           = ZOOM;
+     markBlurDirty();
++    noteCanvasLayoutChanged();
+     damage();
+ }
+ 
+@@ -10918,6 +11220,24 @@
+ bool CScrollOverview::flightDeckAction(const std::string& action) {
+     if (!isCanvasDesktop() || closing || !pMonitor) return false;
+     const auto m = pMonitor.lock();
++    if (action == "home") {
++        stopCanvasMotion();
++        scale->setValueAndWarp(1.F); viewOffset->setValueAndWarp({});
++        navigationReturnOffset = {}; hasNavigationReturn = false;
++        markBlurDirty(); noteCanvasLayoutChanged(); damage(); return true;
++    }
++    if (action == "center") {
++        stopCanvasMotion();
++        return followCanvasWindow(Desktop::focusState()->window(), true);
++    }
++    if (action == "spawn-region") {
++        if (!pendingRegions.empty()) return true;
++        if (canvasCompositorDndActive() || dragActiveWindow || resizeActiveWindow || scrollingPanPointerDown || !canvasForwardedPointerButtons.empty()) return false;
++        stopCanvasMotion(); cancelSpawnRegion(); regionArmed = true;
++        regionDeadline = mechanicsTime() + 60;
++        setCanvasCursor("crosshair"); damage(); return true;
++    }
++    if (action == "cancel-region") { cancelSpawnRegion(); return true; }
+     if (action == "back") {
+         if (SpatialOverview::Experiments::on(ECanvasExperiment::Landing) || SpatialOverview::Experiments::on(ECanvasExperiment::AltTab)) {
+             revertNavigation();
+@@ -11117,3 +11437,7 @@
+     canvasAdoptFocus(WINDOW);
+     return true;
+ }
++
++#include "CanvasFeatures.inc"
++#include "CanvasPlacement.inc"
++#include "CanvasInput.inc"
+--- a/scrollOverview.hpp
++++ b/scrollOverview.hpp
+@@ -18,6 +18,7 @@
+ #include <vector>
+ 
+ #include "Config.hpp"
++#include "CanvasPhysics.hpp"
+ #include "DropIndicator.hpp"
+ #include "IOverview.hpp"
+ 
+@@ -84,6 +85,7 @@
+     bool         cycleAltTab(int direction);
+     void         noteCanvasLayoutChanged();
+     Vector2D     restingCameraOffset() const;
++    float        restingCameraZoom() const;
+     void         warpCameraOffset(const Vector2D& offset);
+     bool         followCanvasWindow(PHLWINDOW window, bool syncFocus, bool animate = true);
+     void         saveSharedCanvasLayout();
+@@ -92,6 +94,9 @@
+     Vector2D     navigationReturnOffset{};
+     bool         hasNavigationReturn = false;
+ 
++    bool handleCanvasPointerConstraint();
++    bool suppressCanvasRelativeMotion() const;
++    std::string mechanicsStateJson() const;
+     void         fullRender() override;
+     void         syncAnimationConfig() override;
+ 
+@@ -128,6 +133,39 @@
+     }
+ 
+   private:
++    static double mechanicsTime();
++    void stopCanvasMotion();
++    void advanceCanvasMotion();
++    void beginMotionSample(bool pan);
++    void sampleWindowMotion();
++    void releaseWindowMotion(PHLWINDOW window);
++    CBox magnetWindowBox(const CBox& world, PHLWINDOW window, bool resize = false) const;
++    CBox magnetLocalBox(const CBox& local, PHLWINDOW window, bool resize = false) const;
++    bool handleRegionButton(uint32_t button, uint32_t state);
++    bool applySpawnRegion(PHLWINDOW window);
++    bool queueCanvasWindow(PHLWINDOW window);
++    PHLWINDOW canvasDialogParent(PHLWINDOW window) const;
++    void placeCanvasDialog(PHLWINDOW window, PHLWINDOW parent);
++    void revealPendingDialogs(PHLWINDOW parent);
++    void startNextPendingRegion();
++    void finishPendingRegion(bool automatic);
++    void forgetPendingRegion(PHLWINDOW window);
++    void clearPendingRegions();
++    void resetSpawnRegion();
++    std::vector<PHLWINDOWREF> pendingRegions;
++    std::vector<std::pair<PHLWINDOWREF, PHLWINDOWREF>> pendingDialogs;
++    void updateSpawnRegion();
++    void cancelSpawnRegion();
++    void renderCanvasMechanics(PHLMONITOR monitor);
++    void renderDoubleBorder(PHLMONITOR monitor, PHLWINDOW window, const CBox& box, float zoom);
++    Hotlilit::MotionSamples panSamples, windowSamples;
++    Hotlilit::Coast panCoast, windowCoast;
++    PHLWINDOWREF coastingWindow;
++    mutable std::optional<double> magnetX, magnetY;
++    bool regionArmed = false, regionDrawing = false;
++    Vector2D regionStart;
++    std::optional<CBox> spawnRegion;
++    double regionDeadline = 0;
+     void   rebuildWorkspaceImages();
+     void   seedRememberedSelections();
+     void   redrawAll(bool forcelowres = false);
+--- /dev/null
++++ b/tests/canvas-physics-test.cpp
+@@ -0,0 +1,62 @@
++#include "CanvasPhysics.hpp"
++#include <cassert>
++#include <iostream>
++using namespace Hotlilit;
++bool near(double a, double b, double e = .001) {
++    return std::abs(a - b) < e;
++}
++int main() {
++    MotionSamples s;
++    assert(s.release(1, 1).length() == 0);
++    s.add(1, {0, 0});
++    s.add(1.04, {40, 0});
++    s.add(1.08, {80, 0});
++    assert(near(s.release(1.08, 1).x, 600));
++    assert(s.release(1.3, 1).length() == 0);
++    s.clear();
++    s.add(1, {0, 0});
++    s.add(1.05, {1, 0});
++    assert(s.release(1.05, 1).length() == 0);
++    s.clear();
++    s.add(1, {0, 0});
++    s.add(1.05, {10000, 0});
++    assert(near(s.release(1.05, .5).x, 4800));
++    Coast a, b;
++    a.start({600, 200}, 1);
++    b.start({600, 200}, 1);
++    Point pa, pb;
++    for (int i = 1; i <= 60; ++i)
++        pa = pa + a.step(1 + i / 60., 1);
++    for (int i = 1; i <= 144; ++i)
++        pb = pb + b.step(1 + i / 144., 1);
++    assert(near(pa.x, pb.x) && near(pa.y, pb.y)); // Frame-rate independent travel.
++    a.start({600, 0}, 1);
++    assert(a.step(3, 1).length() == 0 && !a.active);
++    a.start({600, 0}, 1);
++    a.stop();
++    assert(a.step(1.01, 1).length() == 0);
++    Rect              viewport{-1000, -1000, 4000, 4000};
++    std::vector<Rect> neighbours{{400, 100, 200, 200}};
++    auto              r = magnet({187, 100, 200, 200}, neighbours, viewport, 1, 12, 12);
++    assert(near(r.box.x, 188) && r.x && near(*r.x, 388));
++    r = magnet({170, 100, 200, 200}, neighbours, viewport, 1, 12, 12);
++    assert(!r.x);
++    r = magnet({170, 100, 200, 200}, neighbours, viewport, .5, 12, 12);
++    assert(near(r.box.x, 188));
++    r = magnet({187, 800, 200, 200}, neighbours, viewport, 1, 12, 12);
++    assert(!r.x); // No distant attraction.
++    r = magnet({170, 100, 200, 200}, neighbours, viewport, 1, 12, 12, 388);
++    assert(near(r.box.x, 188)); // Hysteresis.
++    r = magnet({160, 100, 200, 200}, neighbours, viewport, 1, 12, 12, 388);
++    assert(!r.x);
++    r = magnet({100, 100, 287, 200}, neighbours, viewport, 1, 12, 12, {}, {}, false, true, false, true);
++    assert(near(r.box.x, 100) && near(r.box.w, 288));
++    r = magnet({613, 100, 200, 200}, neighbours, viewport, 1, 12, 12, {}, {}, true, false, true, false);
++    assert(near(r.box.x, 612) && near(r.box.w, 201));
++    r = magnet({-994, 200, 200, 200}, {}, viewport, 1, 12, 12);
++    assert(near(r.box.x, -1000));
++    // A latched edge is not replaced by a later, closer candidate.
++    r = magnet({170, 100, 200, 200}, {{400, 100, 200, 200}, {385, 100, 200, 200}}, viewport, 1, 12, 12, 388);
++    assert(near(r.box.x, 188));
++    std::cout << "PASS 18 physics invariants\n";
++}
+--- a/tests/navigator-nested.py
++++ b/tests/navigator-nested.py
+@@ -47,6 +47,7 @@
+     def env(self):
+         e = os.environ.copy()
+         e["WAYLAND_DISPLAY"] = self.socket
++        e["HYPRLAND_INSTANCE_SIGNATURE"] = self.sig
+         return e
+ 
+     def keys(self, *args):
+@@ -71,7 +72,7 @@
+         return json.loads(self.ctl("-j", "activewindow"))
+ 
+     def launch(self):
+-        cfg = (ROOT / "tests/nested.lua").read_text()
++        cfg = getattr(self, "config_source", None) or (ROOT / "tests/nested.lua").read_text()
+         cfg = cfg.replace("@PLUGIN@", str(self.plugin))
+         cfg = cfg.replace('mode = "1280x720@60",', f'mode = "{os.environ.get("NESTED_MODE", "1280x720@60")}",')
+         cfg = cfg.replace("scale = 1,", f"scale = {os.environ.get('NESTED_SCALE', '1')},", 1)
+@@ -85,10 +86,13 @@
+         path = Path(self.tmp.name) / "nested.lua"
+         path.write_text(cfg)
+         env = os.environ.copy()
++        headless = os.environ.get("NESTED_BACKEND") == "headless"
++        # Bootstrap with the parent Wayland backend. Hyprland needs a real
++        # output while starting; headless tests replace it before mapping apps.
+         env["AQ_BACKEND"] = "wayland"
+         env["XDG_STATE_HOME"] = self.state
+         self.log = open(Path(self.tmp.name) / "hyprland.log", "w")
+-        self.proc = subprocess.Popen(["Hyprland", "--config", str(path)], env=env, stdout=self.log, stderr=subprocess.STDOUT)
++        self.proc = subprocess.Popen(["Hyprland", "--config", str(path)], env=env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+         for _ in range(80):
+             if self.proc.poll() is not None:
+                 raise RuntimeError("nested compositor exited; see " + self.log.name)
+@@ -103,11 +107,21 @@
+             time.sleep(0.1)
+         if not self.sig:
+             raise RuntimeError("nested compositor did not register")
++        if headless:
++            self.ctl("output", "create", "headless", "HOTLILIT-TEST")
++            for monitor in json.loads(self.ctl("-j", "monitors")):
++                if monitor["name"] != "HOTLILIT-TEST":
++                    self.ctl("output", "remove", monitor["name"])
++            mode = os.environ.get("NESTED_MODE", "1280x720@60")
++            scale = float(os.environ.get("NESTED_SCALE", "1"))
++            self.ctl("eval", f'hl.monitor({{output="HOTLILIT-TEST",mode="{mode}",position="0x0",scale={scale}}})')
++            self.dispatch('hl.dsp.focus({workspace="1"})')
++            time.sleep(.3)
+         # A nested compositor is itself a window in the host. A tiled host can
+         # resize it below the requested mode, invalidating the popup/pixel tests.
+         # Only float/resize this test process's host window, never user windows.
+         host_sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+-        if host_sig and host_sig != self.sig:
++        if not headless and host_sig and host_sig != self.sig:
+             for _ in range(50):
+                 result = subprocess.run(["hyprctl", "-i", host_sig, "clients", "-j"], capture_output=True, text=True, timeout=3)
+                 hosts = json.loads(result.stdout) if result.returncode == 0 else []
+@@ -145,6 +159,11 @@
+                 self.proc.wait(timeout=8)
+             except Exception:
+                 self.proc.terminate()
++                try:
++                    self.proc.wait(timeout=5)
++                except subprocess.TimeoutExpired:
++                    self.proc.kill()
++                    self.proc.wait(timeout=5)
+         if getattr(self, "log", None):
+             self.log.close()
+ 
+--- a/tests/tools/vpointer.c
++++ b/tests/tools/vpointer.c
+@@ -56,21 +56,36 @@
+     struct zwlr_virtual_pointer_v1* pointer = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(manager, seat);
+     const uint32_t                  W = atoi(argv[1]), H = atoi(argv[2]);
+ 
+-    for (int i = 3; i < argc; ++i) {
+-        const char* cmd = argv[i];
+-        if (!strcmp(cmd, "abs") && i + 2 < argc) {
+-            zwlr_virtual_pointer_v1_motion_absolute(pointer, now_ms(), atoi(argv[i + 1]), atoi(argv[i + 2]), W, H);
++    const int interactive = argc == 4 && !strcmp(argv[3], "stdin");
++    if (interactive) { puts("ready"); fflush(stdout); }
++    char line[4096];
++    char* commands[256];
++    do {
++        int count = argc, first = 3;
++        char** args = argv;
++        if (interactive) {
++            if (!fgets(line, sizeof line, stdin)) break;
++            count = 0; first = 0; args = commands;
++            for (char* token = strtok(line, " \t\r\n"); token && count < 256; token = strtok(NULL, " \t\r\n")) commands[count++] = token;
++        }
++    for (int i = first; i < count; ++i) {
++        const char* cmd = args[i];
++        if (!strcmp(cmd, "abs") && i + 2 < count) {
++            zwlr_virtual_pointer_v1_motion_absolute(pointer, now_ms(), atoi(args[i + 1]), atoi(args[i + 2]), W, H);
+             i += 2;
+-        } else if (!strcmp(cmd, "rel") && i + 2 < argc) {
+-            zwlr_virtual_pointer_v1_motion(pointer, now_ms(), wl_fixed_from_double(atof(argv[i + 1])), wl_fixed_from_double(atof(argv[i + 2])));
++        } else if (!strcmp(cmd, "rel") && i + 2 < count) {
++            zwlr_virtual_pointer_v1_motion(pointer, now_ms(), wl_fixed_from_double(atof(args[i + 1])), wl_fixed_from_double(atof(args[i + 2])));
+             i += 2;
+-        } else if (!strcmp(cmd, "down") || !strcmp(cmd, "up") || !strcmp(cmd, "rdown") || !strcmp(cmd, "rup")) {
+-            const uint32_t BUTTON = cmd[0] == 'r' ? BTN_RIGHT : BTN_LEFT;
++        } else if (!strcmp(cmd, "axis") && i + 1 < count) {
++            zwlr_virtual_pointer_v1_axis_source(pointer, WL_POINTER_AXIS_SOURCE_WHEEL);
++            zwlr_virtual_pointer_v1_axis(pointer, now_ms(), WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double(atof(args[++i])));
++        } else if (!strcmp(cmd, "down") || !strcmp(cmd, "up") || !strcmp(cmd, "rdown") || !strcmp(cmd, "rup") || !strcmp(cmd, "mdown") || !strcmp(cmd, "mup")) {
++            const uint32_t BUTTON = cmd[0] == 'r' ? BTN_RIGHT : cmd[0] == 'm' ? BTN_MIDDLE : BTN_LEFT;
+             const uint32_t STATE  = strstr(cmd, "down") ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
+             zwlr_virtual_pointer_v1_button(pointer, now_ms(), BUTTON, STATE);
+-        } else if (!strcmp(cmd, "sleep") && i + 1 < argc) {
++        } else if (!strcmp(cmd, "sleep") && i + 1 < count) {
+             wl_display_flush(display);
+-            usleep(atoi(argv[i + 1]) * 1000);
++            usleep(atoi(args[i + 1]) * 1000);
+             i += 1;
+             continue;
+         } else {
+@@ -81,6 +96,9 @@
+         wl_display_flush(display);
+         usleep(8000);
+     }
++        wl_display_roundtrip(display);
++        if (interactive) { puts("done"); fflush(stdout); }
++    } while (interactive);
+     wl_display_roundtrip(display);
+     zwlr_virtual_pointer_v1_destroy(pointer);
+     wl_display_roundtrip(display);
