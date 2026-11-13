@@ -187,4 +187,6 @@ This closes the canvas and removes the managed connection block. Installed files
 
 Maintained by [slayPunk](https://github.com/slayPunk). Inspired by [Lilith](https://github.com/ohto121/lilith), built on the [Phantomat](https://github.com/kaolti/phantomat) renderer.
 
+Bug report or feedback - [dm me on Telegram](t.me/ashwagandha4)
+
 [BSD-3-Clause](LICENSE) · [Attribution](NOTICE.md) · [Upstream sources](UPSTREAM.md)
