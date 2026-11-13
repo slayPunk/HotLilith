@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+  <title id="title">HotLilith</title>
+  <desc id="desc">From tiled windows to an infinite canvas for Hyprland.</desc>
+  <rect width="1280" height="360" rx="16" fill="#111315"/>
+  <g fill="none" stroke="#292d30" stroke-width="1">
+    <path d="M760 0v360m80-360v360m80-360v360m80-360v360m80-360v360m80-360v360m80-360v360M720 60h560M720 140h560M720 220h560M720 300h560"/>
+  </g>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="68" y="94" fill="#ff9566" font-size="15" letter-spacing="4">A HYPRLAND PLUGIN</text>
+    <text x="62" y="196" fill="#f5f5f0" font-size="92" font-weight="700" letter-spacing="-5">HotLilith</text>
+    <text x="68" y="252" fill="#adb3b8" font-size="25">From tiling to an infinite canvas.</text>
+  </g>
+  <g stroke-width="2">
+    <rect x="812" y="54" width="172" height="118" rx="10" fill="#1c2023" stroke="#51595e"/>
+    <path d="M812 82h172" stroke="#51595e"/>
+    <circle cx="829" cy="68" r="3" fill="#7c858c"/>
+    <rect x="1000" y="139" width="204" height="154" rx="10" fill="#202426" stroke="#ff9566"/>
+    <path d="M1000 167h204" stroke="#ff9566"/>
+    <circle cx="1017" cy="153" r="3" fill="#ff9566"/>
+    <rect x="757" y="211" width="189" height="106" rx="10" fill="#181c1f" stroke="#51595e"/>
+    <path d="M757 239h189" stroke="#51595e"/>
+    <circle cx="774" cy="225" r="3" fill="#7c858c"/>
+  </g>
+</svg>

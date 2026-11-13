@@ -55,7 +55,7 @@ The harness bootstraps a child compositor through the current Wayland session, t
 
 The session-lock test also needs `wayland-protocols` (the `ext-session-lock-v1` XML). Its test-only lock client accepts an explicit child socket and refuses the declared host socket. It exercises native tiled XWayland restoration with capture/fullscreen, exit before or after unlock, and exit while the lock covers fullscreen. An unlocked keyboard-delivery control is checked before asserting that locked input cannot reach the application. It does not launch your desktop locker or authenticate a user.
 
-Before changing input or fullscreen code, exercise both native Wayland and XWayland, including a real game when possible. Document the exact Proton/backend/capture mode and distinguish observed gameplay from protocol-client tests. See [validation.md](docs/validation.md).
+Before changing input or fullscreen code, exercise both native Wayland and XWayland, including a real game when possible. Document the exact Proton/backend/capture mode and distinguish observed gameplay from protocol-client tests.
 
 ## Keep the renderer patch reproducible
 

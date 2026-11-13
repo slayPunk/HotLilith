@@ -1,156 +1,190 @@
-# HotLilith
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="HotLilith — from tiling to an infinite canvas" width="100%">
+</p>
 
-[Русская инструкция](README.ru.md) · [Validation](docs/validation.md) · [Contributing](CONTRIBUTING.md)
+<p align="center">
+  Move beyond the grid. Arrange real application windows on a canvas,<br>
+  pan and zoom, then return to your Hyprland tiling layout with a shortcut.
+</p>
 
-An infinite canvas for Hyprland, with a hotkey to switch back to tiling. Inspired by [Lilith](https://github.com/ohto121/lilith) and built on a locally adapted [Phantomat](https://github.com/kaolti/phantomat) renderer.
+<p align="center">
+  <a href="https://hypr.land"><img src="https://img.shields.io/badge/Hyprland-0.57.0-58c7ce?style=flat-square" alt="Hyprland 0.57.0"></a>
+  <img src="https://img.shields.io/badge/config-Lua-7797d1?style=flat-square" alt="Lua configuration">
+  <img src="https://img.shields.io/badge/layout-dwindle-f39b72?style=flat-square" alt="Dwindle layout">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-b5b9bd?style=flat-square" alt="BSD-3-Clause license"></a>
+</p>
 
-**0.2 development snapshot.** The plugin targets **Hyprland 0.57.0 with Lua configuration and dwindle**, independently of any desktop preset. Serpantinum is not required. Other compositor versions/layouts need separate validation. A single physical monitor is sufficient.
+<p align="center">
+  <a href="#installation">Installation</a> ·
+  <a href="#controls">Controls</a> ·
+  <a href="#your-theme-your-shortcuts">Customization</a> ·
+  <a href="README.ru.md">Русский</a>
+</p>
 
-![Three synthetic Wayland terminal windows on the HotLilith canvas](docs/assets/preview.png)
+---
 
-## Features
+## Your windows, with room to move
 
-- Switch between tiling and a canvas without restarting applications.
-- Choose the current workspace or all ordinary workspaces, with separate window positions, sizes, camera and zoom memory for each scope.
-- Pan, zoom from 10% to 200%, throw windows and the camera with inertia, and align edges with magnetic guides.
-- Draw a region for every new standalone window. Windows wait in a queue; Escape automatically places the current one. Dialogs follow their parent, including a parent still waiting for placement.
-- Restore the previous dwindle tree and split proportions when its window membership is unchanged. Otherwise, return to a valid new tiled layout.
-- Preserve explicit workspace and scratchpad moves, and the original geometry of floating windows on an unchanged output.
-- Interact with real Wayland and XWayland applications, including Wayland drag-and-drop and relative game input inside scaled windows.
-- Let fullscreen applications use native Hyprland rendering and return to the previous canvas camera and zoom afterwards.
+- **Tiling ↔ canvas.** Keep your applications open and return to native tiling when you need it.
+- **Two scopes.** Use the current workspace or bring ordinary workspaces onto one canvas. Each scope remembers its own arrangement and camera.
+- **Pan, zoom, arrange.** Zoom from 10% to 200%, move with inertia and align windows with magnetic guides.
+- **Draw a place for new windows.** Select an area as each window opens. Dialogs stay with their parent; Escape places a waiting window automatically.
+- **Keep your desktop.** Window decorations and camera animations follow your Hyprland settings. Serpantinum is not required; one monitor is enough.
 
-Pinned windows and special workspaces are excluded. Normal workspace switching closes a workspace-only canvas. Moving a window across the global canvas does not change its workspace; an explicit workspace command does.
+<details>
+<summary>See the canvas</summary>
 
-## Requirements and compatibility
+![Application windows arranged on the HotLilith canvas](docs/assets/preview.png)
 
-| Component | Current requirement |
-|---|---|
-| Compositor | Hyprland **0.57.0**, matching development headers and running ABI |
-| Dependencies | Resolve the requirements of `pkg-config --print-errors --exists hyprland`, including hyprutils **>= 0.14.3** |
-| Desktop preset | None required; Lua `hyprland.lua` and dwindle |
-| Compiler | GCC 15+; the renderer uses `#embed` |
-| Build tools | Make, pkg-config, Python 3, binutils (`strip`) |
-| Libraries | Hyprland, Lua 5.4, hyprgraphics, pangocairo, pixman-1, libdrm, libinput, libudev, wayland-server, xkbcommon |
-| Preview | A running Wayland session, `hyprctl`, `foot` |
+</details>
 
-Dependencies are declared in [source/Makefile](source/Makefile). No compiled plugin is included: build it against your installed compositor. The build wrapper rejects mismatched headers and uses separate object caches for each ABI.
+## Installation
 
-The settings module adds no key bindings and removes none of yours. Optional shortcuts live in [config/bindings.example.lua](config/bindings.example.lua); copy and edit them to avoid collisions. Mouse move/resize examples are included there as comments. Desktop-specific overrides belong in your own dotfiles.
+You need **Hyprland 0.57.0**, a **Lua configuration** and the **dwindle** layout. Build inside your running Hyprland session, with matching development headers and **hyprutils 0.14.3 or newer**.
 
-## Appearance follows your dotfiles
+<details>
+<summary>Build dependencies</summary>
 
-Window borders and gradients, per-window rounding, opacity and shadows use Hyprland's native decorations and window rules. HotLilith does not edit your theme files. Camera transitions inherit `windowsMove` speed, curve and enabled state; globally disabled animations remain disabled. Explicit plugin animation settings override the corresponding inherited values; `animation.inherit = false` selects the plugin defaults. The extra double border is opt-in.
+- GCC 15+ with `#embed` support, Make, Git, pkg-config, Python 3 and binutils.
+- Hyprland development headers, Lua 5.4, hyprgraphics, Pango/Cairo, pixman, libdrm, libinput, libudev, Wayland server and xkbcommon.
+- Optional: `foot` for the disposable preview.
 
-Selection regions, magnetic guides and the minimap use the active/inactive border palette. The minimap follows native rounding and border width. Changes apply after reloading your Hyprland configuration. For a panel palette that differs from Hyprland's border colors, add explicit overrides **after** loading `config/canvas.lua`:
+The library names used by pkg-config are listed in [source/Makefile](source/Makefile). There is no prebuilt `.so`: the plugin must match your compositor's ABI.
 
-```lua
-hl.config({plugin={spatialoverview={canvas={
-  accent = "rgb(89b4fa)",       -- region, guides and minimap focus
-  panel_color = "rgb(1e1e2e)",  -- minimap background
-  -- double_border = true,     -- optional extra native-colored frame
-}}}})
-```
-
-These are examples, not installed theme values. Arbitrary GTK, QML or panel palettes cannot be inferred reliably from Hyprland; your dotfiles theme generator can write this small override block. Optional upstream navigator and distortion modes have separate appearance settings and are disabled in the public canvas preset.
-
-## Build and preview
-
-From this repository's root, inside the matching Hyprland session:
+</details>
 
 ```bash
+git clone https://github.com/slayPunk/HotLilith.git
+cd HotLilith
 bash build.sh
-python3 preview.py
-```
-
-The preview opens a disposable child Hyprland with three synthetic `foot` windows. Close its window or press **Super+Shift+Escape inside the preview** to exit. Its applications, state files and plugin instance are separate from the main session.
-
-## Install without changing key bindings
-
-```bash
-python3 install.py
-```
-
-This copies the build and preset into `${XDG_DATA_HOME:-$HOME/.local/share}/hotlilith`. To connect it to `~/.config/hypr/hyprland.lua`:
-
-```bash
 python3 install.py --enable
 ```
 
-The installer backs up the config and appends a marked plugin-load and settings-module block after the existing configuration. It does not include the optional binding example. Hyprland may reload automatically; otherwise use `hyprctl reload`. `--config PATH` and `--target PATH` select alternative locations, but do not adapt the preset's key bindings to another desktop.
+The installer backs up your Lua config and adds the plugin and settings module. It **does not add or remove key bindings**. If Hyprland does not reload automatically, run `hyprctl reload`.
 
-To disconnect:
+Files are installed under `${XDG_DATA_HOME:-$HOME/.local/share}/hotlilith`. The default config is `${XDG_CONFIG_HOME:-$HOME/.config}/hypr/hyprland.lua`; use `--config PATH` or `--target PATH` for other locations.
+
+<details>
+<summary>Try a separate preview before connecting it</summary>
+
+After building, run:
 
 ```bash
-python3 install.py --remove
+python3 preview.py
 ```
 
-Removal first checks that the canvas dispatcher succeeded and that no canvas cameras or fullscreen records remain. An unconfirmed shutdown leaves the managed connection intact for recovery. Installed files and backups remain. The inactive plugin can remain loaded until the session ends.
+This opens a separate Hyprland window with demonstration applications. Close that window or press **Super+Shift+Escape inside it** to exit. Your desktop configuration stays separate.
 
-## Opt in to controls
+</details>
 
-After enabling the settings module, review the installed `config/bindings.example.lua`, choose unused combinations, then explicitly include your edited copy from `hyprland.lua`. For example, if you use the installed example unchanged:
+## Controls
+
+### Choose your shortcuts
+
+The keyboard shortcuts below are provided by an **optional example**. Review and edit the installed `config/bindings.example.lua` to avoid conflicts, then add this **after the HotLilith connection block** in your `hyprland.lua`:
 
 ```lua
 local data = os.getenv("XDG_DATA_HOME") or (os.getenv("HOME") .. "/.local/share")
 dofile(data .. "/hotlilith/config/bindings.example.lua")
 ```
 
-You can also bind the public dispatchers directly, or test them from a terminal:
+### Everyday actions
 
-```bash
-hyprctl dispatch 'hl.plugin.spatialoverview.mode("toggle")'
-hyprctl dispatch 'hl.plugin.spatialoverview.mode("scope")'
-hyprctl dispatch 'hl.plugin.spatialoverview.mode("off")'
+| Action | Control |
+| :--- | :--- |
+| Tiling ↔ canvas | <kbd>Super</kbd> + <kbd>G</kbd> |
+| Current workspace ↔ global canvas | <kbd>Super</kbd> + <kbd>Ctrl</kbd> + <kbd>G</kbd> |
+| Emergency return to tiling | <kbd>Super</kbd> + <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd> |
+| Pan the canvas | Middle drag, or left drag on empty background |
+| Zoom around the pointer | Wheel on the background; <kbd>Ctrl</kbd> + wheel or <kbd>Super</kbd> + wheel over a window |
+| Move / resize a window | Your existing Super + left / right drag bindings |
+| Fit all windows | <kbd>Super</kbd> + <kbd>Z</kbd> |
+| Overview ↔ 100% | <kbd>Super</kbd> + <kbd>Alt</kbd> + <kbd>G</kbd> |
+| Place a waiting window automatically | <kbd>Escape</kbd> |
+
+Ordinary scrolling over a window stays with the application. Mouse move/resize bindings are not installed by HotLilith; examples are included as comments in the bindings file.
+
+<details>
+<summary>More keyboard controls</summary>
+
+| Action | Shortcut |
+| :--- | :--- |
+| Focus a neighbouring window | Super + Ctrl + Alt + arrows |
+| Move the camera | Super + Alt + arrows |
+| Zoom in / out | Super + Ctrl + `=` / `-` |
+| Return to the canvas origin at 100% | Super + Ctrl + Home |
+| Centre the active window | Super + Ctrl + C |
+| Draw an area before opening an application | Super + Ctrl + N |
+| Toggle manual pointer capture | Super + Ctrl + P |
+| Release a captured pointer | Super + Ctrl + Escape |
+
+When no window is waiting, Escape cancels a region or stops inertia. The scope shortcut selects the next scope if the canvas is closed.
+
+</details>
+
+### Opening and arranging windows
+
+Enter the canvas to arrange existing windows freely with gaps between them. New standalone windows wait for you to **drag an area on the canvas**; multiple windows are placed one at a time. Press Escape to place the current waiting window automatically. File dialogs and other transient dialogs open with their parent.
+
+Dragging a window across the **global canvas does not move it to another workspace**. Use your normal Hyprland workspace commands for that. Switching workspaces closes a workspace-only canvas.
+
+Window positions, sizes, camera and zoom are remembered separately for each scope. Returning to tiling restores the previous dwindle tree when its window membership is unchanged.
+
+## Your theme, your shortcuts
+
+HotLilith follows native window borders, gradients, rounding, opacity and shadows. Camera motion inherits `windowsMove`; disabled desktop animations remain disabled. Selection and minimap colors follow your active/inactive border colors.
+
+For explicit canvas colors, add an override **after** the settings module:
+
+```lua
+hl.config({plugin={spatialoverview={canvas={
+  accent = "rgb(ff9566)",
+  panel_color = "rgb(202426)",
+}}}})
 ```
 
-The example suggests these combinations; they are **not installed as bindings by default**:
+These colors are optional. HotLilith does not replace your theme, panel, launcher or workspace bindings. See [config/canvas.lua](config/canvas.lua) for the preset and [config/bindings.example.lua](config/bindings.example.lua) for shortcut examples.
 
-| Action | Binding |
-|---|---|
-| Tiling ↔ canvas | Super+G |
-| Current workspace ↔ global scope | Super+Ctrl+G |
-| Emergency return to tiling | Super+Ctrl+Shift+G |
-| Pan | Middle drag, or left drag on empty background |
-| Zoom around the pointer | Wheel on empty background; Ctrl+wheel or Super+wheel over a window |
-| Move / resize a window | Existing Super+left / right drag bindings |
-| Focus a neighbouring canvas window | Super+Ctrl+Alt+arrows |
-| Move the camera | Super+Alt+arrows |
-| Fit all windows | Super+Z |
-| Overview ↔ 100% | Super+Alt+G |
-| Keyboard zoom | Super+Ctrl+= / Super+Ctrl+- |
-| Camera origin at 100% | Super+Ctrl+Home |
-| Centre the active window | Super+Ctrl+C |
-| Draw a region before launching an application | Super+Ctrl+N |
-| Toggle manual pointer capture for an older game | Super+Ctrl+P |
-| Release the game pointer | Super+Ctrl+Escape |
-| Place the current waiting window automatically; otherwise cancel a region or stop inertia | Escape |
+<details>
+<summary>Layout memory</summary>
 
-When the canvas is off, the scope shortcut selects the next scope. The generic module and optional example never unbind Super+arrows, Super+J, Super+Shift+F, lock, launcher, clipboard or workspace shortcuts. The example adds suggested chords only after you choose to load it.
+Memory is stored in `${XDG_STATE_HOME:-$HOME/.local/state}/hotlilit/canvas-memory-v2.txt` with permissions `0600`. It contains application classes and window titles; changing titles may require manual placement. Set `remember_layout = false` in your canvas settings to disable it. Delete the file while the canvas is closed to reset saved arrangements.
 
-## Persistence and games
+</details>
 
-Layout memory is stored atomically with permissions `0600` in `${XDG_STATE_HOME:-$HOME/.local/state}/hotlilit/canvas-memory-v2.txt`. It contains application classes and window titles. Window matching uses application and title, so changing titles can require manual placement. The most recent changes can be lost before a pending save completes. Disable persistence with `remember_layout = false` in your installed preset.
+## Update or disconnect
 
-Relative mouse deltas are forwarded in device units; canvas zoom does not rescale camera sensitivity. Locks and confinement regions use the projected window coordinates. Canvas move/resize gestures suppress relative motion. Some older games need manual capture; use Super+Ctrl+Escape to release it.
+Before replacing a loaded plugin, disconnect it:
 
-Celeste and Prince of Persia: The Sands of Time were exercised in scaled windows. Sands of Time camera and keyboard movement worked at 40% zoom using WineD3D and manual capture. This is not a compatibility guarantee for other games, Proton versions, overlays or anti-cheat systems. See [the validation record](docs/validation.md).
+```bash
+python3 install.py --remove
+```
 
-## Updates and limits
+Log out of Hyprland and back in. After updating Hyprland itself, a newer HotLilith version may be needed too. Then rebuild and reconnect:
 
-After updating Hyprland, restart the session, rebuild and reinstall. The installer refuses to overwrite an already loaded `spatialoverview` plugin. Matching an ABI is necessary; future internal API changes may also require source changes.
+```bash
+git pull --ff-only
+bash build.sh
+python3 install.py --enable
+```
 
-The module is separate from your desktop configuration. A dotfiles reinstall can remove its include block; reconnect it after checking the new configuration. Personal Serpantinum adapters are maintained in private dotfiles, outside this public plugin.
+To disconnect HotLilith:
 
-Window groups are currently rejected on entry. Physical multi-monitor setups, hotplug, driver changes and long gaming sessions need further validation. Exact old split-tree restoration requires unchanged tiled-window membership.
+```bash
+python3 install.py --remove
+```
 
-## Development
+This closes the canvas and removes the managed connection block. Installed files and config backups remain. If you added the optional bindings include, remove that line from your config too.
 
-CI runs compositor-independent installer/build tests and C++ mechanics/DnD models. Full integration tests require a real matching Hyprland session; they are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+## Before you use it
 
-Current coverage includes a plain Lua Hyprland session with no Serpantinum imports and existing user bindings. Broader compositor-version, output and game testing remains planned.
+- Window groups must be ungrouped before entering the canvas. Pinned windows and special workspaces stay outside it.
+- A changed set of windows produces a new tiled layout rather than the exact old split tree.
+- Game fullscreen and pointer capture depend on the application and runtime. Borderless fullscreen can have display/input problems; release capture with **Super+Ctrl+Escape** if needed.
+- Multi-monitor and hotplug behavior may vary. Start with a single-monitor setup.
 
-## Credits and license
+## Credits
 
-HotLilith changes are maintained by [slayPunk](https://github.com/slayPunk). The renderer is derived from Phantomat; upstream copyrights and its **BSD-3-Clause** license are retained. Protocol XML files retain their own notices. Lilith is an interaction reference; its source code is not included.
+Maintained by [slayPunk](https://github.com/slayPunk). Inspired by [Lilith](https://github.com/ohto121/lilith), built on the [Phantomat](https://github.com/kaolti/phantomat) renderer.
 
-See [LICENSE](LICENSE), [NOTICE.md](NOTICE.md) and [UPSTREAM.md](UPSTREAM.md) for attribution and pinned sources. Existing internal names (`spatialoverview`, `hotlilit`, `syspunk-canvas`) are retained for compatibility.
+[BSD-3-Clause](LICENSE) · [Attribution](NOTICE.md) · [Upstream sources](UPSTREAM.md)
