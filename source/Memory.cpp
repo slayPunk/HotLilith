@@ -1,3 +1,4 @@
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
 #define WLR_USE_UNSTABLE
 #include "Memory.hpp"
 #include "Navigator.hpp"
@@ -12,7 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <hyprland/src/desktop/state/WindowState.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
 
 namespace SpatialOverview::Memory {
     namespace {
@@ -118,7 +119,7 @@ namespace SpatialOverview::Memory {
         if (!window)
             return {};
         load();
-        const auto klass = clean(window->m_class.empty() ? window->m_initialClass : window->m_class);
+        const auto klass = clean(window->metadata().appID().empty() ? window->metadata().initialAppID() : window->metadata().appID());
         const auto title = clean(Navigator::displayTitle(window));
         if (klass.empty())
             return {};
@@ -127,9 +128,9 @@ namespace SpatialOverview::Memory {
         for (auto& e : entries) {
             if (e.scope != scope || e.klass != klass)
                 continue;
-            if (e.window == window->m_stableID)
+            if (e.window == window->metadata().stableID())
                 return e.box;
-            if (e.window && std::ranges::none_of(live, [&](const auto& w) { return w && w->m_isMapped && w->m_stableID == e.window; }))
+            if (e.window && std::ranges::none_of(live, [&](const auto& w) { return w && w->mapped() && w->metadata().stableID() == e.window; }))
                 e.window = 0;
             if (e.window)
                 continue;
@@ -140,7 +141,7 @@ namespace SpatialOverview::Memory {
         }
         if (!best || (!restoring && best->title != title))
             return {};
-        best->window = window->m_stableID;
+        best->window = window->metadata().stableID();
         return best->box;
     }
 
@@ -158,17 +159,17 @@ namespace SpatialOverview::Memory {
         for (const auto& p : windows) {
             if (!p.window || !saneBox(p.box))
                 continue;
-            const auto klass = clean(p.window->m_class.empty() ? p.window->m_initialClass : p.window->m_class);
+            const auto klass = clean(p.window->metadata().appID().empty() ? p.window->metadata().initialAppID() : p.window->metadata().appID());
             const auto title = clean(Navigator::displayTitle(p.window));
             if (klass.empty())
                 continue;
-            auto it = std::ranges::find_if(entries, [&](const Entry& e) { return e.scope == scope && e.window == p.window->m_stableID; });
+            auto it = std::ranges::find_if(entries, [&](const Entry& e) { return e.scope == scope && e.window == p.window->metadata().stableID(); });
             if (it == entries.end()) {
                 // A previously closed window can reclaim an exact home. Do not
                 // merge two simultaneous windows with the same class/title.
                 it = std::ranges::find_if(entries, [&](const Entry& e) { return e.scope == scope && !e.window && e.klass == klass && e.title == title && e.box == p.box; });
             }
-            Entry e{scope, klass, title, p.box, now, p.window->m_stableID};
+            Entry e{scope, klass, title, p.box, now, p.window->metadata().stableID()};
             if (it == entries.end())
                 entries.push_back(std::move(e));
             else

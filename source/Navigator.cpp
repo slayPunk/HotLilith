@@ -1,3 +1,6 @@
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
+#include <hyprland/src/desktop/view/window/WindowBackend.hpp>
+#include <hyprland/src/desktop/view/window/WindowGroupMembership.hpp>
 #define WLR_USE_UNSTABLE
 
 #include "Navigator.hpp"
@@ -11,10 +14,10 @@
 #include <unordered_set>
 
 #include <hyprland/src/Compositor.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/view/Group.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
 
 static std::string canvasLowercaseAscii(std::string value) {
     std::ranges::transform(value, value.begin(), [](unsigned char c) { return sc<char>(std::tolower(c)); });
@@ -29,8 +32,8 @@ ECanvasWindowCategory canvasWindowCategory(const PHLWINDOW& window) {
     if (!window)
         return ECanvasWindowCategory::OTHER;
 
-    const auto CLASS = canvasLowercaseAscii(window->m_class + " " + window->m_initialClass);
-    const auto TITLE = canvasLowercaseAscii(window->m_title + " " + window->m_initialTitle);
+    const auto CLASS = canvasLowercaseAscii(window->metadata().appID() + " " + window->metadata().initialAppID());
+    const auto TITLE = canvasLowercaseAscii(window->metadata().title() + " " + window->metadata().initialTitle());
     const auto ALL   = CLASS + " " + TITLE;
 
     if (canvasContainsAny(CLASS, {"foot", "alacritty", "kitty", "ghostty", "wezterm", "konsole", "terminal"}))
@@ -76,17 +79,17 @@ namespace SpatialOverview::Navigator {
         PHLWINDOW overviewWindow(const PHLWINDOW& window) {
             if (!window)
                 return nullptr;
-            if (window->m_group)
-                return window->m_group->current();
+            if (window->grouping().group())
+                return window->grouping().group()->current();
             return window;
         }
 
         bool isCandidate(const PHLWINDOW& window) {
             if (!Desktop::View::validMapped(window))
                 return false;
-            if (window->m_workspace && window->m_workspace->m_isSpecialWorkspace)
+            if (window->m_workspace && window->m_workspace->type() == Workspace::eWorkspaceType::SPECIAL)
                 return false;
-            if (window->m_pinned)
+            if ((window->m_state & Desktop::View::WINDOW_STATE_PINNED))
                 return false;
             return true;
         }
@@ -214,7 +217,7 @@ namespace SpatialOverview::Navigator {
         const SWindowFields& fieldsFor(const PHLWINDOW& window) {
             const auto TITLE = displayTitle(window);
             const auto CLASS = displayClass(window);
-            auto&      entry = g_fieldCache[window->m_stableID];
+            auto&      entry = g_fieldCache[window->metadata().stableID()];
             if (entry.title != TITLE || entry.klass != CLASS || entry.foldedTitle.chars.empty()) {
                 entry.title          = TITLE;
                 entry.klass          = CLASS;
@@ -298,8 +301,8 @@ namespace SpatialOverview::Navigator {
         // focus around, and the list must not reshuffle under the user.
         auto windows = candidates();
         std::ranges::stable_sort(windows, [](const PHLWINDOW& a, const PHLWINDOW& b) {
-            const auto A = g_focusStamps.contains(a->m_stableID) ? g_focusStamps.at(a->m_stableID) : 0;
-            const auto B = g_focusStamps.contains(b->m_stableID) ? g_focusStamps.at(b->m_stableID) : 0;
+            const auto A = g_focusStamps.contains(a->metadata().stableID()) ? g_focusStamps.at(a->metadata().stableID()) : 0;
+            const auto B = g_focusStamps.contains(b->metadata().stableID()) ? g_focusStamps.at(b->metadata().stableID()) : 0;
             return A > B;
         });
         if (const auto RETURN = g_state.returnWindow.lock()) {
@@ -337,21 +340,21 @@ namespace SpatialOverview::Navigator {
     std::string displayTitle(const PHLWINDOW& window) {
         if (!window)
             return {};
-        if (!window->m_title.empty())
-            return window->m_title;
-        if (!window->m_initialTitle.empty())
-            return window->m_initialTitle;
+        if (!window->metadata().title().empty())
+            return window->metadata().title();
+        if (!window->metadata().initialTitle().empty())
+            return window->metadata().initialTitle();
         return displayClass(window);
     }
 
     std::string displayClass(const PHLWINDOW& window) {
         if (!window)
             return {};
-        if (!window->m_class.empty())
-            return window->m_class;
-        if (!window->m_initialClass.empty())
-            return window->m_initialClass;
-        return window->m_isX11 ? "xwayland" : "window";
+        if (!window->metadata().appID().empty())
+            return window->metadata().appID();
+        if (!window->metadata().initialAppID().empty())
+            return window->metadata().initialAppID();
+        return window->backend().isX11() ? "xwayland" : "window";
     }
 
     std::string_view categoryCode(ECanvasWindowCategory category) {
@@ -562,14 +565,14 @@ namespace SpatialOverview::Navigator {
         const auto TARGET = overviewWindow(window);
         if (!TARGET || (g_state.open && !force))
             return;
-        g_focusStamps[TARGET->m_stableID] = ++g_focusCounter;
+        g_focusStamps[TARGET->metadata().stableID()] = ++g_focusCounter;
     }
 
     void forget(const PHLWINDOW& window) {
         if (!window)
             return;
-        g_focusStamps.erase(window->m_stableID);
-        g_fieldCache.erase(window->m_stableID);
+        g_focusStamps.erase(window->metadata().stableID());
+        g_fieldCache.erase(window->metadata().stableID());
         if (!g_state.open)
             return;
         const auto BEFORE = g_state.results.size();

@@ -5,10 +5,10 @@ void canvasRememberPointerPosition(const Vector2D&);
 // Only the cursor lock/confinement and absolute surface position are projected.
 bool CScrollOverview::handleCanvasPointerConstraint() {
     if (!isCanvasDesktop() || closing || sessionLocked() || canvasCompositorDndActive() || regionArmed || dragPendingPrimary || dragActiveWindow || resizePointerDown ||
-        resizeActiveWindow || scrollingPanPointerDown || spacePanHeld || (g_pInputManager->getModsFromAllKBs() & HL_MODIFIER_META))
+        resizeActiveWindow || scrollingPanPointerDown || spacePanHeld || (g_pInputManager->getModsFromAllKBs() & Input::HL_MODIFIER_META))
         return false;
     const auto window = Desktop::focusState()->window();
-    if (!shouldShowOverviewWindow(window) || window->m_pinned || !canvasDrawsWindow(window))
+    if (!shouldShowOverviewWindow(window) || (window->m_state & Desktop::View::WINDOW_STATE_PINNED) || !canvasDrawsWindow(window))
         return false;
     const auto surface    = Desktop::focusState()->surface();
     const auto owner      = Desktop::View::CWLSurface::fromResource(surface);
@@ -18,7 +18,7 @@ bool CScrollOverview::handleCanvasPointerConstraint() {
     const bool manual     = g_canvasManualCapture.lock() == window;
     if ((!constraint || !constraint->isActive()) && !manual)
         return false;
-    if (g_canvasCaptureBlocked.contains(window->m_stableID)) {
+    if (g_canvasCaptureBlocked.contains(window->metadata().stableID())) {
         if (constraint)
             constraint->deactivate();
         return false;
@@ -48,7 +48,7 @@ bool CScrollOverview::handleCanvasPointerConstraint() {
             return false;
         position = region.closestPoint(position);
     }
-    const auto  local    = (position - drawn.pos()) / std::max(.01F, canvasZoom()) * window->m_X11SurfaceScaledBy;
+    const auto  local    = window->backend().surfaceLocalToBuffer((position - drawn.pos()) / std::max(.01F, canvasZoom()));
     static bool handling = false;
     if (handling)
         return true;
@@ -74,7 +74,7 @@ bool CScrollOverview::suppressCanvasRelativeMotion() const {
     if (!isCanvasDesktop() || closing)
         return false;
     return regionArmed || dragPendingPrimary || dragActiveWindow || resizePointerDown || resizeActiveWindow || scrollingPanPointerDown || spacePanHeld ||
-        (g_pInputManager->getModsFromAllKBs() & HL_MODIFIER_META);
+        (g_pInputManager->getModsFromAllKBs() & Input::HL_MODIFIER_META);
 }
 
 bool canvasSuppressRelativeMotion() {
@@ -88,13 +88,13 @@ bool canvasSuppressRelativeMotion() {
     const auto focused = g_pSeatManager->m_state.pointerFocus.lock();
     const auto surface = Desktop::View::CWLSurface::fromResource(focused);
     const auto window  = surface ? Desktop::View::CWindow::fromView(surface->view()) : nullptr;
-    return window && g_canvasCaptureBlocked.contains(window->m_stableID);
+    return window && g_canvasCaptureBlocked.contains(window->metadata().stableID());
 }
 
 bool canvasReleasePointerCapture() {
     bool released = false;
     if (const auto window = g_canvasManualCapture.lock()) {
-        g_canvasCaptureBlocked.insert(window->m_stableID);
+        g_canvasCaptureBlocked.insert(window->metadata().stableID());
         released = true;
     }
     g_canvasManualCapture.reset();
@@ -102,9 +102,9 @@ bool canvasReleasePointerCapture() {
         const auto c      = ref.lock();
         const auto owner  = c ? c->owner() : nullptr;
         const auto window = owner ? Desktop::View::CWindow::fromView(owner->view()) : nullptr;
-        if (!c || !window || (!g_canvasNativeLayout.contains(window->m_stableID) && !canvasFullscreenWindow(window)))
+        if (!c || !window || (!g_canvasNativeLayout.contains(window->metadata().stableID()) && !canvasFullscreenWindow(window)))
             continue;
-        g_canvasCaptureBlocked.insert(window->m_stableID);
+        g_canvasCaptureBlocked.insert(window->metadata().stableID());
         // deactivate() may remove a one-shot from m_constraints: deferred below.
         released = true;
     }
@@ -113,7 +113,7 @@ bool canvasReleasePointerCapture() {
         const auto c      = ref.lock();
         const auto owner  = c ? c->owner() : nullptr;
         const auto window = owner ? Desktop::View::CWindow::fromView(owner->view()) : nullptr;
-        if (c && window && g_canvasCaptureBlocked.contains(window->m_stableID))
+        if (c && window && g_canvasCaptureBlocked.contains(window->metadata().stableID()))
             c->deactivate();
     }
     if (released) {
@@ -135,7 +135,7 @@ bool canvasCapturePointer() {
         if (!canvas || !canvas->canvasDrawsWindow(window))
             continue;
         g_canvasManualCapture = window;
-        g_canvasCaptureBlocked.erase(window->m_stableID);
+        g_canvasCaptureBlocked.erase(window->metadata().stableID());
         Pointer::Cursor::overrideController->unsetOverride(Pointer::Cursor::CURSOR_OVERRIDE_SPECIAL_ACTION);
         g_canvasCursorShape.clear();
         return true;

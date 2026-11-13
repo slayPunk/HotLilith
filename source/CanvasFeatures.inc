@@ -37,7 +37,7 @@ void CScrollOverview::sampleWindowMotion() {
 }
 
 void CScrollOverview::releaseWindowMotion(PHLWINDOW w) {
-    if (!isCanvasDesktop() || !Desktop::View::validMapped(w) || !w->m_isFloating || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:inertia_enabled"))
+    if (!isCanvasDesktop() || !Desktop::View::validMapped(w) || !w->isFloating() || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:inertia_enabled"))
         return;
     auto v = windowSamples.release(mechanicsTime(), canvasZoom());
     if (magnetX)
@@ -57,7 +57,7 @@ CBox CScrollOverview::magnetWindowBox(const CBox& world, PHLWINDOW window, bool 
     const auto                  viewport = currentCanvasViewportWorld();
     std::vector<Hotlilit::Rect> neighbours;
     for (const auto& w : Desktop::windowState()->windows()) {
-        if (w == window || !shouldShowOverviewWindow(w) || w->m_pinned || !w->layoutTarget() || !g_canvasNativeLayout.contains(w->m_stableID))
+        if (w == window || !shouldShowOverviewWindow(w) || (w->m_state & Desktop::View::WINDOW_STATE_PINNED) || !w->layoutTarget() || !g_canvasNativeLayout.contains(w->metadata().stableID()))
             continue;
         const auto b = w->layoutTarget()->position();
         neighbours.push_back({b.x, b.y, b.w, b.h});
@@ -119,7 +119,7 @@ void CScrollOverview::advanceCanvasMotion() {
     }
     if (windowCoast.active) {
         const auto w = coastingWindow.lock();
-        if (!shouldShowOverviewWindow(w) || !w->m_isFloating || !w->layoutTarget() || !g_canvasNativeLayout.contains(w->m_stableID) || Fullscreen::controller()->isFullscreen(w))
+        if (!shouldShowOverviewWindow(w) || !w->isFloating() || !w->layoutTarget() || !g_canvasNativeLayout.contains(w->metadata().stableID()) || Fullscreen::controller()->isFullscreen(w))
             windowCoast.stop();
         else {
             const auto d   = windowCoast.step(now, canvasZoom());
@@ -214,7 +214,7 @@ void CScrollOverview::updateSpawnRegion() {
 }
 
 bool CScrollOverview::applySpawnRegion(PHLWINDOW window) {
-    if (regionArmed || !spawnRegion || mechanicsTime() > regionDeadline || !shouldShowOverviewWindow(window) || !g_canvasNativeLayout.contains(window->m_stableID) ||
+    if (regionArmed || !spawnRegion || mechanicsTime() > regionDeadline || !shouldShowOverviewWindow(window) || !g_canvasNativeLayout.contains(window->metadata().stableID()) ||
         !window->layoutTarget())
         return false;
     auto       box    = *spawnRegion;
@@ -249,12 +249,12 @@ void CScrollOverview::renderCanvasMechanics(PHLMONITOR monitor) {
         fill.box   = b;
         fill.color = accent;
         fill.color.a *= .12F;
-        g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(fill));
+        Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).add(makeUnique<CRectPassElement>(fill));
         CBorderPassElement::SBorderData border;
         border.box        = b;
         border.grad1      = gradient;
         border.borderSize = std::max(1, sc<int>(std::round(ScrollOverview::Config::getValue<int>("general:border_size") * monitor->m_scale)));
-        g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(border));
+        Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).add(makeUnique<CBorderPassElement>(border));
     }
     if (!ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:magnet_guides") || (!dragActiveWindow && !resizeActiveWindow && !windowCoast.active))
         return;
@@ -266,18 +266,18 @@ void CScrollOverview::renderCanvasMechanics(PHLMONITOR monitor) {
         CRectPassElement::SRectData line;
         line.box   = local(axis == 0 ? CBox{*guide, viewport.y, 1.0 / canvasZoom(), viewport.h} : CBox{viewport.x, *guide, viewport.w, 1.0 / canvasZoom()});
         line.color = accent;
-        g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(line));
+        Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).add(makeUnique<CRectPassElement>(line));
     }
 }
 
 void CScrollOverview::renderDoubleBorder(PHLMONITOR monitor, PHLWINDOW window, const CBox& box, float zoom) {
-    if (!isCanvasDesktop() || !monitor || !window || box.empty() || window->m_pinned || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:double_border"))
+    if (!isCanvasDesktop() || !monitor || !window || box.empty() || (window->m_state & Desktop::View::WINDOW_STATE_PINNED) || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:double_border"))
         return;
-    if (window->getRealBorderSize() <= 0 || !window->m_ruleApplicator->decorate().valueOrDefault())
+    if (window->presentation().borderSize() <= 0 || !window->m_ruleApplicator->decorate().valueOrDefault())
         return;
-    const auto gradient = window->m_realBorderColor;
-    const int width = std::max(1, sc<int>(std::round(monitor->m_scale * zoom * window->getRealBorderSize())));
-    const int rounding = std::max(0, sc<int>(std::round(window->rounding() * monitor->m_scale * zoom)));
+    const auto gradient = OverviewWindow::decorationState(window, DECORATION_BORDER).current;
+    const int width = std::max(1, sc<int>(std::round(monitor->m_scale * zoom * window->presentation().borderSize())));
+    const int rounding = std::max(0, sc<int>(std::round(window->presentation().rounding() * monitor->m_scale * zoom)));
     CBorderPassElement::SBorderData outer;
     outer.box = box;
     outer.box.expand(width);
@@ -285,19 +285,19 @@ void CScrollOverview::renderDoubleBorder(PHLMONITOR monitor, PHLWINDOW window, c
     outer.borderSize = width;
     outer.round      = rounding > 0 ? rounding + width : 0;
     outer.outerRound = rounding > 0 ? rounding + 2 * width : 0;
-    outer.roundingPower = window->roundingPower();
+    outer.roundingPower = window->presentation().roundingPower();
     outer.a          = .45F;
     outer.window     = window;
-    g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(outer));
+    Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).add(makeUnique<CBorderPassElement>(outer));
     CBorderPassElement::SBorderData inner;
     inner.box        = box;
     inner.grad1      = gradient;
     inner.borderSize = width;
     inner.round      = rounding;
     inner.outerRound = rounding > 0 ? rounding + width : 0;
-    inner.roundingPower = window->roundingPower();
+    inner.roundingPower = window->presentation().roundingPower();
     inner.window     = window;
-    g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(inner));
+    Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).add(makeUnique<CBorderPassElement>(inner));
 }
 
 std::string CScrollOverview::mechanicsStateJson() const {

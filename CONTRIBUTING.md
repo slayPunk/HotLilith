@@ -1,6 +1,6 @@
 # Contributing to HotLilith
 
-HotLilith 0.2 currently targets Hyprland 0.56.2, Lua configuration and dwindle, without a desktop-preset dependency. Keep the generic module free of user-specific bindings and imports. Discuss broader compositor-version support before relying on newer private APIs.
+HotLilith 0.2 currently targets Hyprland 0.57.0, Lua configuration and dwindle, without a desktop-preset dependency. Keep the generic module free of user-specific bindings and imports. Discuss broader compositor-version support before relying on newer private APIs.
 
 ## Repository layout
 
@@ -30,7 +30,7 @@ The installer tests use temporary configs. The build tests simulate ABI probes b
 
 ## Full integration checks
 
-Use a running Wayland/Hyprland 0.56.2 session with matching development headers and the dependencies in the README. Additional tools: `foot`, `grim`, `wayland-scanner`, Wayland client/xkbcommon development files, PyGObject + GTK4, and SDL2 development files for the relative-input client. XWayland must be available for X11 checks. The appearance checks additionally require Pillow and inspect actual screenshots and camera motion across a live theme reload.
+Use a running Wayland/Hyprland 0.57.0 session with matching development headers and the dependencies in the README. Additional tools: `foot`, `grim`, `wayland-scanner`, Wayland client/xkbcommon development files, PyGObject + GTK4, and SDL2 development files for the relative-input client. XWayland must be available for X11 checks. The appearance checks additionally require Pillow and inspect actual screenshots and camera motion across a live theme reload.
 
 ```bash
 bash build.sh
@@ -40,14 +40,20 @@ python3 tests/standalone.py
 python3 tests/appearance.py
 python3 tests/integration.py
 python3 tests/regressions.py
+python3 tests/workspace_addresses.py
 python3 tests/mechanics.py
 python3 tests/placement.py
 python3 tests/relative_input.py wayland
 python3 tests/relative_input.py x11
+python3 tests/session_lock.py
+python3 tests/size_hints.py x11
+python3 tests/size_hints.py wayland
 python3 tests/dnd.py
 ```
 
 The harness bootstraps a child compositor through the current Wayland session, then creates a fixed virtual output. It uses the child's IPC/Wayland sockets and temporary state files. It still needs a parent Wayland session. Captured logs/screenshots go under ignored `work/`. A missing SDL2 client is not a passed game-input test.
+
+The session-lock test also needs `wayland-protocols` (the `ext-session-lock-v1` XML). Its test-only lock client accepts an explicit child socket and refuses the declared host socket. It exercises native tiled XWayland restoration with capture/fullscreen, exit before or after unlock, and exit while the lock covers fullscreen. An unlocked keyboard-delivery control is checked before asserting that locked input cannot reach the application. It does not launch your desktop locker or authenticate a user.
 
 Before changing input or fullscreen code, exercise both native Wayland and XWayland, including a real game when possible. Document the exact Proton/backend/capture mode and distinguish observed gameplay from protocol-client tests. See [validation.md](docs/validation.md).
 

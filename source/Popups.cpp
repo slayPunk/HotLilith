@@ -29,26 +29,27 @@
 #define private public
 #define protected public
 #include <hyprland/src/desktop/view/Popup.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
 #include <hyprland/src/protocols/XDGShell.hpp>
+#include <hyprland/src/desktop/view/window/WindowBackend.hpp>
 #undef protected
 #undef private
 
 std::optional<CBox> canvasPopupConstraint(const PHLWINDOW& window);
 
 bool canvasRepositionPopup(Desktop::View::CPopup* popup) {
-    if (!popup || !popup->m_resource || popup->m_windowOwner.expired())
+    if (!popup || !popup->m_backend || popup->m_windowOwner.expired())
         return false;
     const auto CONSTRAINT = canvasPopupConstraint(popup->m_windowOwner.lock());
     if (!CONSTRAINT)
         return false;
-    popup->m_resource->applyPositioning(*CONSTRAINT, popup->t1ParentCoords());
+    popup->m_backend->applyPositioning(*CONSTRAINT, popup->t1ParentCoords());
     return true;
 }
 
 // Whether any popup of the window is fading in or out.
 bool popupTreeFading(const PHLWINDOW& window) {
-    if (!window || window->m_isX11 || !window->m_popupHead)
+    if (!window || window->backend().isX11() || !window->m_popupHead)
         return false;
     bool fading = false;
     window->m_popupHead->breadthfirst(

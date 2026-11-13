@@ -2,6 +2,7 @@
 set -euo pipefail
 base="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$base/work/build"
+pkg-config --print-errors --exists hyprland
 c++ -std=c++2b "$base/tools/header-abi.cpp" -o "$base/work/build/header-abi" $(pkg-config --cflags hyprland pixman-1 libdrm)
 hyprlandHeaderAbi="$("$base/work/build/header-abi")"
 hyprctl -j version > "$base/work/build/running-version.json"

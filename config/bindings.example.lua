@@ -1,4 +1,4 @@
--- OPTIONAL example bindings for Hyprland 0.56.2.
+-- OPTIONAL example bindings for Hyprland 0.57.0.
 -- Copy/edit the combinations before including this file. Never loaded by install.py.
 -- Existing user bindings are not removed. Do not add a combination you already use.
 local function run(name, action)

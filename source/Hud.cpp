@@ -1,3 +1,4 @@
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
 #define WLR_USE_UNSTABLE
 
 #include "Hud.hpp"
@@ -13,7 +14,7 @@
 #include <unordered_map>
 
 #include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Texture.hpp>
 
@@ -461,7 +462,7 @@ namespace SpatialOverview::Hud {
                     const auto WINDOW = state.results[i].window.lock();
                     if (!WINDOW)
                         continue;
-                    key += std::format("|{}:{}:{}", WINDOW->m_stableID, Navigator::displayTitle(WINDOW), directionHint(WINDOW, view));
+                    key += std::format("|{}:{}:{}", WINDOW->metadata().stableID(), Navigator::displayTitle(WINDOW), directionHint(WINDOW, view));
                 }
                 key += std::format("|n{}", state.results.size());
             }
@@ -1120,7 +1121,7 @@ namespace SpatialOverview::Hud {
         // Width buckets keep zoom animations from re-rendering every frame.
         const double WIDTH = NATURAL <= LIMIT ? NATURAL : std::max(48.0 * s, std::floor(LIMIT / (24.0 * s)) * 24.0 * s);
 
-        const auto KEY = std::format("{}\x1f{}\x1f{:.2f}\x1f{}\x1f{}\x1f{}", TITLE, window->m_class, s, sc<int>(WIDTH), selected, THEME.signature);
+        const auto KEY = std::format("{}\x1f{}\x1f{:.2f}\x1f{}\x1f{}\x1f{}", TITLE, window->metadata().appID(), s, sc<int>(WIDTH), selected, THEME.signature);
         if (const auto IT = g_labels.find(KEY); IT != g_labels.end()) {
             IT->second.lastUsed = g_frame;
             return IT->second.label;

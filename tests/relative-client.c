@@ -8,7 +8,7 @@ int main(void) {
     if(!w){puts(SDL_GetError());return 1;}
     SDL_Renderer* r=SDL_CreateRenderer(w,-1,SDL_RENDERER_SOFTWARE);
     printf("ready %s\n",SDL_GetCurrentVideoDriver());
-    int relative=0,grab=0,run=1;double yaw=0;
+    int relative=0,grab=0,run=1,lastWidth=0,lastHeight=0;double yaw=0;
     while(run) {
         SDL_Event e;
         while(SDL_PollEvent(&e)) {
@@ -23,6 +23,11 @@ int main(void) {
                     printf("relative %d result %d %s\n",relative,result,SDL_GetError());
                 }
                 if(e.key.keysym.sym==SDLK_g) {grab=!grab;SDL_SetWindowGrab(w,grab?SDL_TRUE:SDL_FALSE);printf("grab %d\n",grab);}
+                if(e.key.keysym.sym==SDLK_n) {
+                    int width,height;SDL_GetWindowSize(w,&width,&height);
+                    SDL_SetWindowMaximumSize(w,width,height);
+                    printf("maximum %d %d\n",width,height);
+                }
             }
             if(e.type==SDL_MOUSEMOTION) {
                 printf("motion %d %d %d\n",SDL_GetRelativeMouseMode(),e.motion.xrel,e.motion.yrel);
@@ -30,6 +35,10 @@ int main(void) {
             }
         }
         int width,height;SDL_GetRendererOutputSize(r,&width,&height);
+        if(width!=lastWidth || height!=lastHeight) {
+            printf("render-size %d %d\n",width,height);
+            lastWidth=width;lastHeight=height;
+        }
         SDL_SetRenderDrawColor(r,20,28,44,255);SDL_RenderClear(r);
         SDL_SetRenderDrawColor(r,90,190,240,255);
         for(int x=-width;x<width*2;x+=80) {

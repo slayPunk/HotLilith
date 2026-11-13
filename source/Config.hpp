@@ -33,6 +33,11 @@ void registerDispatcher(const std::string& name, TDispatcher dispatcher);
 void registerGesture(TGestureRegistrar gestureRegistrar, TGestureKeyword gestureKeyword);
 void registerConfig();
 
+inline bool setByUser(const std::string& name) {
+    const auto flag = ::Config::mgr()->getConfigValue(name).setByUser;
+    return flag && *flag;
+}
+
 template <typename T>
 CConfigValue<T>& valueRef(const std::string& name) {
     static std::unordered_map<std::string, UP<CConfigValue<T>>> values;

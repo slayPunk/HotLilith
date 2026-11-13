@@ -1,18 +1,23 @@
 #define WLR_USE_UNSTABLE
 
+#include <array>
 #include <unistd.h>
 #include <sstream>
 
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
 #include <hyprland/src/xwayland/XSurface.hpp>
+#define private public
 #include <hyprland/src/xwayland/XWayland.hpp>
+#undef private
 #include <hyprland/src/config/ConfigManager.hpp>
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/event/EventBus.hpp>
-#include <hyprland/src/managers/KeybindManager.hpp>
+#include <hyprland/src/keybinds/Manager.hpp>
+#include <hyprland/src/keybinds/Resolver.hpp>
+#include <hyprland/src/config/shared/actions/ConfigActions.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/render/ElementRenderer.hpp>
@@ -62,15 +67,15 @@ CBox canvasX11Configure(void* surface, const CBox& box);
 CBox canvasX11Request(void* window, CBox box);
 void canvasReleaseX11Windows();
 bool canvasCapturePointer();
-typedef void (*origRenderWorkspace)(void*, PHLMONITOR, PHLWORKSPACE, const Time::steady_tp&, const CBox&);
+typedef void (*origRenderWorkspace)(void*, Render::CRenderContext&, PHLMONITOR, PHLWORKSPACE, const Time::steady_tp&, const CBox&);
 typedef void (*origAddDamageA)(void*, const CBox&);
 typedef void (*origAddDamageB)(void*, const pixman_region32_t*);
 typedef void (*origDamageSurface)(void*, SP<CWLSurfaceResource>, double, double, double);
 typedef void (*origScheduleFrame)(void*, Aquamarine::IOutput::scheduleFrameReason);
 typedef void (*origSendFrameEventsToWorkspace)(void*, PHLMONITOR, PHLWORKSPACE, const Time::steady_tp&);
 typedef void (*origSurfaceFrame)(void*, const Time::steady_tp&);
-typedef void (*origDrawTex)(void*, WP<CTexPassElement>, const CRegion&);
-typedef void (*origElementDrawTex)(void*, WP<CTexPassElement>, const CRegion&);
+typedef void (*origDrawTex)(void*, Render::CRenderContext&, WP<CTexPassElement>, const CRegion&);
+typedef void (*origElementDrawTex)(void*, Render::CRenderContext&, WP<CTexPassElement>, const CRegion&);
 
 static bool g_unloading = false;
 using origCanvasRelative = void (*)(void*, uint64_t, const Vector2D&, const Vector2D&);
@@ -91,29 +96,36 @@ static bool g_scrollOverviewHooksActive = false;
 
 static void failNotif(const std::string& reason);
 
+static auto overviewHooks() {
+    // Read current pointers: hooks are created after static initialization.
+    return std::array{
+        g_pScrollRenderWorkspaceHook,
+        g_pScrollScheduleFrameHook,
+        g_pScrollDamageSurfaceHook,
+        g_pScrollSendFrameEventsHook,
+        g_pScrollSurfaceFrameHook,
+        g_pScrollAddDamageHookA,
+        g_pScrollAddDamageHookB,
+        g_pScrollDrawTexHook,
+        g_pScrollElementDrawTexHook,
+        g_pPopupRepositionHook,
+        g_pBeginDragTargetHook,
+        g_pX11ConfigureHook,
+        g_pX11ConfigureRequestHook,
+        g_pCanvasRelativeHook,
+    };
+}
+
 bool ensureScrollOverviewHooks() {
     if (g_scrollOverviewHooksActive)
         return true;
 
-    bool success = g_pScrollRenderWorkspaceHook->hook();
-    success      = success && g_pScrollScheduleFrameHook->hook();
-    success      = success && g_pScrollDamageSurfaceHook->hook();
-    success      = success && g_pScrollSendFrameEventsHook->hook();
-    success      = success && g_pScrollSurfaceFrameHook->hook();
-    success      = success && g_pScrollAddDamageHookA->hook();
-    success      = success && g_pScrollAddDamageHookB->hook();
-    success      = success && g_pScrollDrawTexHook->hook();
-    success      = success && g_pScrollElementDrawTexHook->hook();
-    success      = success && g_pPopupRepositionHook->hook();
-    success      = success && g_pBeginDragTargetHook->hook();
-    success      = success && g_pX11ConfigureHook->hook();
-    success      = success && g_pX11ConfigureRequestHook->hook();
-    success      = success && g_pCanvasRelativeHook->hook();
-
-    if (!success) {
-        disableScrollOverviewHooks();
-        failNotif("Failed enabling overview hooks (is other overview plugin enabled?)");
-        return false;
+    for (auto* hook : overviewHooks()) {
+        if (!hook || !hook->hook()) {
+            disableScrollOverviewHooks();
+            failNotif("Failed enabling overview hooks (is other overview plugin enabled?)");
+            return false;
+        }
     }
 
     g_scrollOverviewHooksActive = true;
@@ -121,34 +133,11 @@ bool ensureScrollOverviewHooks() {
 }
 
 void disableScrollOverviewHooks() {
-    if (g_pCanvasRelativeHook) g_pCanvasRelativeHook->unhook();
-    if (g_pX11ConfigureRequestHook)
-        g_pX11ConfigureRequestHook->unhook();
-    if (g_pX11ConfigureHook)
-        g_pX11ConfigureHook->unhook();
-    if (g_pBeginDragTargetHook)
-        g_pBeginDragTargetHook->unhook();
-    if (g_pPopupRepositionHook)
-        g_pPopupRepositionHook->unhook();
-    if (g_pScrollElementDrawTexHook)
-        g_pScrollElementDrawTexHook->unhook();
-    if (g_pScrollDrawTexHook)
-        g_pScrollDrawTexHook->unhook();
-    if (g_pScrollAddDamageHookB)
-        g_pScrollAddDamageHookB->unhook();
-    if (g_pScrollAddDamageHookA)
-        g_pScrollAddDamageHookA->unhook();
-    if (g_pScrollSurfaceFrameHook)
-        g_pScrollSurfaceFrameHook->unhook();
-    if (g_pScrollSendFrameEventsHook)
-        g_pScrollSendFrameEventsHook->unhook();
-    if (g_pScrollDamageSurfaceHook)
-        g_pScrollDamageSurfaceHook->unhook();
-    if (g_pScrollScheduleFrameHook)
-        g_pScrollScheduleFrameHook->unhook();
-    if (g_pScrollRenderWorkspaceHook)
-        g_pScrollRenderWorkspaceHook->unhook();
-
+    const auto hooks = overviewHooks();
+    for (auto it = hooks.rbegin(); it != hooks.rend(); ++it) {
+        if (*it)
+            (*it)->unhook();
+    }
     g_scrollOverviewHooksActive = false;
 }
 
@@ -169,10 +158,10 @@ static void hkScheduleFrame(void* thisptr, Aquamarine::IOutput::scheduleFrameRea
 }
 
 //
-static void hkRenderWorkspace(void* thisptr, PHLMONITOR pMonitor, PHLWORKSPACE pWorkspace, const Time::steady_tp& now, const CBox& geometry) {
+static void hkRenderWorkspace(void* thisptr, Render::CRenderContext& ctx, PHLMONITOR pMonitor, PHLWORKSPACE pWorkspace, const Time::steady_tp& now, const CBox& geometry) {
     const auto OVERVIEW = scrollOverviewForMonitor(pMonitor);
-    if (!OVERVIEW || renderingOverview)
-        rc<origRenderWorkspace>(g_pScrollRenderWorkspaceHook->m_original)(thisptr, pMonitor, pWorkspace, now, geometry);
+    if (!OVERVIEW || renderingOverview || &ctx != &g_pHyprRenderer->context())
+        rc<origRenderWorkspace>(g_pScrollRenderWorkspaceHook->m_original)(thisptr, ctx, pMonitor, pWorkspace, now, geometry);
     else {
         const bool PREVRENDERINGOVERVIEW = renderingOverview;
         const auto PREVRENDERINGMONITOR  = renderingOverviewMonitor;
@@ -215,15 +204,15 @@ static void hkSurfaceFrame(void* thisptr, const Time::steady_tp& now) {
     rc<origSurfaceFrame>(g_pScrollSurfaceFrameHook->m_original)(thisptr, now);
 }
 
-static void hkDrawTex(void* thisptr, WP<CTexPassElement> element, const CRegion& damage) {
+static void hkDrawTex(void* thisptr, Render::CRenderContext& ctx, WP<CTexPassElement> element, const CRegion& damage) {
     if (!renderingOverview || !element || !g_pHyprRenderer) {
-        rc<origDrawTex>(g_pScrollDrawTexHook->m_original)(thisptr, element, damage);
+        rc<origDrawTex>(g_pScrollDrawTexHook->m_original)(thisptr, ctx, element, damage);
         return;
     }
 
-    auto& renderModif = g_pHyprRenderer->m_renderData.renderModif;
+    auto& renderModif = ctx.m_data.renderModif;
     if (!renderModif.enabled || renderModif.modifs.empty()) {
-        rc<origDrawTex>(g_pScrollDrawTexHook->m_original)(thisptr, element, damage);
+        rc<origDrawTex>(g_pScrollDrawTexHook->m_original)(thisptr, ctx, element, damage);
         return;
     }
 
@@ -234,7 +223,7 @@ static void hkDrawTex(void* thisptr, WP<CTexPassElement> element, const CRegion&
     const auto previousElementClipBox    = element->m_data.clipBox;
 
     auto transformedDamage = damage.copy();
-    if (g_pHyprRenderer->m_renderData.currentWindow && element->m_data.surface) {
+    if (ctx.m_data.currentWindow && element->m_data.surface) {
         // The backing workspace's visibility calculation may expose only the
         // part of a window that intersected its original monitor. Canvas mode
         // deliberately renders that window elsewhere, so use the complete
@@ -244,32 +233,32 @@ static void hkDrawTex(void* thisptr, WP<CTexPassElement> element, const CRegion&
         transformedSurfaceBox.round();
         element->m_data.clipRegion = CRegion{transformedSurfaceBox};
         element->m_data.clipBox    = {};
-        g_pHyprRenderer->m_renderData.clipBox = {};
+        ctx.m_data.clipBox = {};
         transformedDamage                    = CRegion{transformedSurfaceBox};
     } else {
         if (!element->m_data.clipRegion.empty())
             renderModif.applyToRegion(element->m_data.clipRegion);
         if (!element->m_data.clipBox.empty())
             renderModif.applyToBox(element->m_data.clipBox);
-        else if (!g_pHyprRenderer->m_renderData.clipBox.empty())
-            renderModif.applyToBox(g_pHyprRenderer->m_renderData.clipBox);
+        else if (!ctx.m_data.clipBox.empty())
+            renderModif.applyToBox(ctx.m_data.clipBox);
     }
 
-    rc<origDrawTex>(g_pScrollDrawTexHook->m_original)(thisptr, element, transformedDamage);
+    rc<origDrawTex>(g_pScrollDrawTexHook->m_original)(thisptr, ctx, element, transformedDamage);
 
     element->m_data.clipRegion = previousElementClipRegion;
     element->m_data.clipBox    = previousElementClipBox;
 }
 
-static void hkElementDrawTex(void* thisptr, WP<CTexPassElement> element, const CRegion& damage) {
+static void hkElementDrawTex(void* thisptr, Render::CRenderContext& ctx, WP<CTexPassElement> element, const CRegion& damage) {
     if (!renderingOverview || !element || !g_pHyprRenderer) {
-        rc<origElementDrawTex>(g_pScrollElementDrawTexHook->m_original)(thisptr, element, damage);
+        rc<origElementDrawTex>(g_pScrollElementDrawTexHook->m_original)(thisptr, ctx, element, damage);
         return;
     }
 
-    auto& renderModif = g_pHyprRenderer->m_renderData.renderModif;
-    if (!renderModif.enabled || renderModif.modifs.empty() || !g_pHyprRenderer->m_renderData.currentWindow || !element->m_data.surface) {
-        rc<origElementDrawTex>(g_pScrollElementDrawTexHook->m_original)(thisptr, element, damage);
+    auto& renderModif = ctx.m_data.renderModif;
+    if (!renderModif.enabled || renderModif.modifs.empty() || !ctx.m_data.currentWindow || !element->m_data.surface) {
+        rc<origElementDrawTex>(g_pScrollElementDrawTexHook->m_original)(thisptr, ctx, element, damage);
         return;
     }
 
@@ -284,7 +273,7 @@ static void hkElementDrawTex(void* thisptr, WP<CTexPassElement> element, const C
     const auto previousElementBox        = element->m_data.box;
     const auto previousElementClipRegion = element->m_data.clipRegion.copy();
     const auto previousElementClipBox    = element->m_data.clipBox;
-    const auto previousRendererClipBox   = g_pHyprRenderer->m_renderData.clipBox;
+    const auto previousRendererClipBox   = ctx.m_data.clipBox;
 
     renderModif.applyToBox(element->m_data.box);
     element->m_data.box.round();
@@ -294,16 +283,16 @@ static void hkElementDrawTex(void* thisptr, WP<CTexPassElement> element, const C
         renderModif.applyToBox(element->m_data.clipBox);
 
     const CRegion transformedDamage{element->m_data.box};
-    g_pHyprRenderer->m_renderData.clipBox = {};
+    ctx.m_data.clipBox = {};
     renderModif                           = {};
 
-    rc<origElementDrawTex>(g_pScrollElementDrawTexHook->m_original)(thisptr, element, transformedDamage);
+    rc<origElementDrawTex>(g_pScrollElementDrawTexHook->m_original)(thisptr, ctx, element, transformedDamage);
 
     renderModif                              = previousRenderModif;
     element->m_data.box                      = previousElementBox;
     element->m_data.clipRegion               = previousElementClipRegion;
     element->m_data.clipBox                  = previousElementClipBox;
-    g_pHyprRenderer->m_renderData.clipBox     = previousRendererClipBox;
+    ctx.m_data.clipBox     = previousRendererClipBox;
 }
 
 // Title-bar drags of apps that draw their own (xdg move/resize requests) run
@@ -326,8 +315,8 @@ static void hkX11Configure(void* thisptr, const CBox& box) {
     rc<origX11Configure>(g_pX11ConfigureHook->m_original)(thisptr, canvasX11Configure(thisptr, box));
 }
 
-typedef void (*origX11ConfigureRequest)(void*, CBox);
-static void hkX11ConfigureRequest(void* thisptr, CBox box) {
+typedef void (*origX11ConfigureRequest)(void*, const CBox&);
+static void hkX11ConfigureRequest(void* thisptr, const CBox& box) {
     rc<origX11ConfigureRequest>(g_pX11ConfigureRequestHook->m_original)(thisptr, canvasX11Request(thisptr, box));
 }
 
@@ -345,13 +334,7 @@ static void hkX11ClientMessage(void* thisptr, xcb_client_message_event_t* e) {
         e->data.data32[1] == FULLSCREEN->second || e->data.data32[2] == FULLSCREEN->second)
         return CALL();
 
-    SP<CXWaylandSurface> surface;
-    for (const auto& window : Desktop::windowState()->windows()) {
-        if (window && window->m_isX11 && window->m_xwaylandSurface && window->m_xwaylandSurface->m_xID == e->window) {
-            surface = window->m_xwaylandSurface.lock();
-            break;
-        }
-    }
+    const auto surface = g_pXWayland && g_pXWayland->m_wm ? g_pXWayland->m_wm->windowForXID(e->window) : SP<CXWaylandSurface>{};
     if (!surface)
         return CALL();
 
@@ -433,8 +416,8 @@ static std::vector<PHLMONITOR> overviewTargetMonitors(const std::string& target)
 }
 
 static SP<IOverview> dispatcherOverview() {
-    const auto CURRENTKEYBIND = g_pKeybindManager ? g_pKeybindManager->m_currentKeybind : SP<SKeybind>{};
-    if (CURRENTKEYBIND && CURRENTKEYBIND->key.starts_with("mouse"))
+    const auto& actions = Config::Actions::state();
+    if (actions && actions->m_bindInvocationDepth > 0 && actions->m_lastCode == 0 && actions->m_lastMouseCode == 0)
         return g_pInputManager ? scrollOverviewAt(g_pInputManager->getMouseCoordsInternal()) : SP<IOverview>{};
 
     return activeScrollOverview();
@@ -465,7 +448,7 @@ bool openCanvasOverview(PHLMONITOR monitor) {
 void canvasFullscreenEvent(PHLWINDOW window); // scrollOverview.cpp
 bool canvasPointerMoved();
 std::string canvasStateJson();
-static SP<SHyprCtlCommand> g_stateCommand;
+static SP<IPC::Socket1::SCommand> g_stateCommand;
 void canvasFullscreenReset();
 bool canvasToggleFill(PHLWINDOW window);
 bool canvasTogglePin(PHLWINDOW window);
@@ -768,7 +751,7 @@ static void* findFnOrThrow(const std::string& name, std::initializer_list<std::s
 
 // shared core: register / unregister the overview trackpad gesture. used by both the hyprlang
 // keyword and the Lua `spatialoverview.gesture` function so both configure the same gesture system.
-static std::expected<void, std::string> applyOverviewGesture(size_t fingerCount, eTrackpadGestureDirection direction, const std::string& action, uint32_t modMask,
+static std::expected<void, std::string> applyOverviewGesture(size_t fingerCount, eTrackpadGestureDirection direction, const std::string& action, Input::ModifierMask modMask,
                                                              float deltaScale, bool disableInhibit) {
     if (fingerCount <= 1 || fingerCount >= 10)
         return std::unexpected(std::format("Invalid value {} for finger count", fingerCount));
@@ -796,9 +779,9 @@ static SDispatchResult onRegisterOverviewGesture(size_t fingerCount, const std::
     if (direction == TRACKPAD_GESTURE_DIR_NONE)
         return {.success = false, .error = std::format("Invalid direction: {}", directionStr)};
 
-    uint32_t modMask = 0;
-    if (!mods.empty() && g_pKeybindManager)
-        modMask = g_pKeybindManager->stringToModMask(mods);
+    Input::ModifierMask modMask = Input::HL_MODIFIER_NONE;
+    if (!mods.empty() && Keybinds::mgr())
+        modMask = Keybinds::modMaskFromString(mods);
 
     const auto res = applyOverviewGesture(fingerCount, direction, action, modMask, std::clamp(deltaScale, 0.1F, 10.F), disableInhibit);
     if (!res)
@@ -832,14 +815,14 @@ static Hyprlang::CParseResult overviewGestureKeyword(const char* LHS, const char
     }
 
     int      startDataIdx   = 2;
-    uint32_t modMask        = 0;
+    Input::ModifierMask modMask = Input::HL_MODIFIER_NONE;
     float    deltaScale     = 1.F;
     bool     disableInhibit = false;
 
     while (true) {
 
         if (data[startDataIdx].starts_with("mod:")) {
-            modMask = g_pKeybindManager->stringToModMask(std::string{data[startDataIdx].substr(4)});
+            modMask = Keybinds::modMaskFromString(std::string{data[startDataIdx].substr(4)});
             startDataIdx++;
             continue;
         } else if (data[startDataIdx].starts_with("scale:")) {
@@ -883,7 +866,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_pScrollRenderWorkspaceHook = HyprlandAPI::createFunctionHook(
         SCROLLOVERVIEW_HANDLE,
-        findFnOrThrow("renderWorkspace", {"CHyprRenderer::renderWorkspace(", "IHyprRenderer::renderWorkspace("}),
+        findFnOrThrow("renderWorkspace", {"CHyprRenderer::renderWorkspace(", "IHyprRenderer::renderWorkspace(Render::CRenderContext&, Hyprutils::Memory::CSharedPointer<Monitor::CMonitor>"}),
         rc<void*>(hkRenderWorkspace));
 
     g_pScrollScheduleFrameHook = HyprlandAPI::createFunctionHook(
@@ -918,12 +901,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_pScrollDrawTexHook = HyprlandAPI::createFunctionHook(
         SCROLLOVERVIEW_HANDLE,
-        findFnOrThrow("draw", {"CGLElementRenderer::draw(Hyprutils::Memory::CWeakPointer<CTexPassElement>"}),
+        findFnOrThrow("draw", {"CGLElementRenderer::draw(Render::CRenderContext&, Hyprutils::Memory::CWeakPointer<CTexPassElement>"}),
         rc<void*>(hkDrawTex));
 
     g_pScrollElementDrawTexHook = HyprlandAPI::createFunctionHook(
         SCROLLOVERVIEW_HANDLE,
-        findFnOrThrow("drawTex", {"IElementRenderer::drawTex(Hyprutils::Memory::CWeakPointer<CTexPassElement>"}),
+        findFnOrThrow("drawTex", {"IElementRenderer::drawTex(Render::CRenderContext&, Hyprutils::Memory::CWeakPointer<CTexPassElement>"}),
         rc<void*>(hkElementDrawTex));
 
     g_pBeginDragTargetHook = HyprlandAPI::createFunctionHook(SCROLLOVERVIEW_HANDLE,
@@ -932,7 +915,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_pX11ConfigureHook = HyprlandAPI::createFunctionHook(SCROLLOVERVIEW_HANDLE, findFnOrThrow("configure", {"CXWaylandSurface::configure("}),
                                                           rc<void*>(hkX11Configure));
-    g_pX11ConfigureRequestHook = HyprlandAPI::createFunctionHook(SCROLLOVERVIEW_HANDLE, findFnOrThrow("onX11ConfigureRequest", {"CWindow::onX11ConfigureRequest("}),
+    g_pX11ConfigureRequestHook = HyprlandAPI::createFunctionHook(SCROLLOVERVIEW_HANDLE, findFnOrThrow("onConfigureRequest", {"CWindow::onConfigureRequest("}),
                                                                  rc<void*>(hkX11ConfigureRequest));
 
     g_pCanvasRelativeHook = HyprlandAPI::createFunctionHook(SCROLLOVERVIEW_HANDLE,
@@ -951,8 +934,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         if (const auto overview = scrollOverviewForMonitor(monitor))
             overview->onPreRender();
     });
-    static auto HUDSTAGE = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
-        if (stage == RENDER_LAST_MOMENT)
+    static auto HUDSTAGE = Event::bus()->m_events.render.stage.listen([](const Event::SRenderStageEvent& event) {
+        if (event.stage == RENDER_LAST_MOMENT)
             SpatialOverview::BarrelShader::applyPendingHud();
     });
     const auto dropMonitorOverview = [](PHLMONITOR monitor) {
@@ -1003,7 +986,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     });
 
     // hyprctl spatialoverview: the canvases' state as JSON, for scripts and tests.
-    g_stateCommand = HyprlandAPI::registerHyprCtlCommand(SCROLLOVERVIEW_HANDLE, SHyprCtlCommand{.name = "spatialoverview", .exact = true, .fn = [](eHyprCtlOutputFormat, std::string) {
+    g_stateCommand = HyprlandAPI::registerHyprCtlCommand(SCROLLOVERVIEW_HANDLE, IPC::Socket1::SCommand{.name = "spatialoverview", .handler = [](const IPC::Socket1::SRequest&) -> IPC::Socket1::SResponse {
                                                              return canvasStateJson();
                                                          }});
 
@@ -1023,7 +1006,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_flightDeckIdle = nullptr;
     g_flightDeckRequest.reset();
     g_flightDeckNativePending = false;
-    g_pHyprRenderer->m_renderPass.removeAllOfType("CScrollOverviewPassElement");
+    Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).removeAllOfType("CScrollOverviewPassElement");
 
     g_unloading = true;
     if (g_stateCommand)

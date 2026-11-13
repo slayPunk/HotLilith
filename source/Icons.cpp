@@ -1,3 +1,4 @@
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
 #define WLR_USE_UNSTABLE
 
 #include "Icons.hpp"
@@ -14,7 +15,7 @@
 #include <vector>
 
 #include <hyprgraphics/image/Image.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
 
 namespace SpatialOverview::Icons {
     namespace {
@@ -265,7 +266,7 @@ namespace SpatialOverview::Icons {
         const std::string* pathFor(const PHLWINDOW& window) {
             if (!window)
                 return nullptr;
-            const auto APPID = window->m_class.empty() ? window->m_initialClass : window->m_class;
+            const auto APPID = window->metadata().appID().empty() ? window->metadata().initialAppID() : window->metadata().appID();
             if (APPID.empty())
                 return nullptr;
             auto pathIt = g_paths.find(APPID);

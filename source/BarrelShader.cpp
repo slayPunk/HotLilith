@@ -107,7 +107,7 @@ void requestReload() {
         return;
 
     g_pHyprRenderer->m_reloadScreenShader = true;
-    if (const auto MONITOR = g_pHyprRenderer->m_renderData.pMonitor.lock())
+    if (const auto MONITOR = g_pHyprRenderer->context().m_data.pMonitor.lock())
         g_pHyprRenderer->damageMonitor(MONITOR);
 }
 
@@ -205,7 +205,7 @@ bool updateHud(const SP<Render::ITexture>& texture, const std::array<float, 4>& 
         return false;
 
     pendingHud = {.texture = texture, .rect = rect, .alpha = std::clamp(alpha, 0.F, 1.F), .atlas = atlas && atlas->m_texID ? atlas : nullptr, .regions = regions,
-                  .monitor = g_pHyprRenderer->m_renderData.pMonitor};
+                  .monitor = g_pHyprRenderer->context().m_data.pMonitor};
     return true;
 }
 
@@ -225,7 +225,7 @@ void applyPendingHud() {
 
     // Every frame of every monitor either gets its own palette or an empty
     // rectangle, so a palette can never linger on the wrong output.
-    const bool SHOW = pending.texture && pending.texture->m_texID && pending.monitor && pending.monitor == g_pHyprRenderer->m_renderData.pMonitor;
+    const bool SHOW = pending.texture && pending.texture->m_texID && pending.monitor && pending.monitor == g_pHyprRenderer->context().m_data.pMonitor;
 
     // The final pass samples the frame from unit 0. Park the HUD textures on
     // units nothing else uses between here and that pass.
@@ -240,7 +240,7 @@ void applyPendingHud() {
     }
 
     const auto PREVIOUS = Render::GL::g_pHyprOpenGL->useShader(SHADER);
-    if (const auto MONITOR = g_pHyprRenderer->m_renderData.pMonitor.lock()) {
+    if (const auto MONITOR = g_pHyprRenderer->context().m_data.pMonitor.lock()) {
         if (const auto LOCATION = glGetUniformLocation(SHADER->program(), "screenTransform"); LOCATION >= 0)
             glUniform1i(LOCATION, sc<int>(MONITOR->m_transform));
         if (const auto LOCATION = glGetUniformLocation(SHADER->program(), "screenSize"); LOCATION >= 0)

@@ -1,7 +1,7 @@
 #include <cstdio>
 #include <string>
 #include <hyprland/src/version.h>
-// Same ABI identity as PluginAPI.hpp in the pinned Hyprland 0.56.2 API,
+// Same ABI identity as PluginAPI.hpp in the pinned Hyprland 0.57.0 API,
 // without the compositor-only globals instantiated by the full plugin header.
 static std::string minor(const char* version) {
     std::string text{version};

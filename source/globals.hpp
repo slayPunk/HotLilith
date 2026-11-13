@@ -13,6 +13,7 @@ bool syspunkCanvasActive();
 bool syspunkCanvasCompatible(PHLWORKSPACE workspace, bool workspaceOnly);
 bool syspunkCanvasWorkspaceOnly();
 int64_t syspunkCanvasWorkspaceID();
+std::string syspunkCanvasWorkspaceAddress();
 void syspunkCanvasPrepare(PHLWORKSPACE workspace, bool workspaceOnly);
 void syspunkCanvasStop();
 bool canvasSuppressRelativeMotion();

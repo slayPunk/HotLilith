@@ -10,7 +10,8 @@
 #include <hyprland/src/config/values/types/IntValue.hpp>
 #include <hyprland/src/config/values/types/StringValue.hpp>
 #include <hyprland/src/config/values/types/GradientValue.hpp>
-#include <hyprland/src/managers/KeybindManager.hpp>
+#include <hyprland/src/keybinds/Manager.hpp>
+#include <hyprland/src/config/shared/actions/ConfigActions.hpp>
 #include <hyprland/src/config/shared/animation/AnimationTree.hpp>
 
 #include <regex>
@@ -154,7 +155,7 @@ int dispatcherFactoryLua(lua_State* L, std::string_view name) {
     if (!DISPATCHER->isArgValid(arg))
         return luaL_error(L, "%s: invalid argument '%s', %s", DISPATCHER->name.data(), arg, DISPATCHER->invalidArgError.data());
 
-    if (g_pKeybindManager && g_pKeybindManager->m_currentKeybind && g_pKeybindManager->m_currentKeybind->handler == "__lua") {
+    if (Config::Actions::state()->m_bindInvocationDepth > 0) {
         return runDispatcherNow(L, *DISPATCHER, arg);
     }
 
@@ -292,6 +293,8 @@ static void registerLuaFunctions() {
         lua_setfield(L, -2, "scope");
         lua_pushinteger(L, syspunkCanvasWorkspaceID());
         lua_setfield(L, -2, "workspace_id");
+        lua_pushstring(L, syspunkCanvasWorkspaceAddress().c_str());
+        lua_setfield(L, -2, "workspace_address");
         return 1;
     });
     // Where the live tuner saves, so the config can apply it (level 3).
@@ -609,7 +612,7 @@ bool getAnimationEnabled() {
     if (!getValue<bool>("animations:enabled"))
         return false;
     constexpr auto NAME = "plugin:spatialoverview:animation:enabled";
-    if (!getValue<bool>("plugin:spatialoverview:animation:inherit") || ::Config::mgr()->getConfigValue(NAME).setByUser)
+    if (!getValue<bool>("plugin:spatialoverview:animation:inherit") || setByUser(NAME))
         return getValue<bool>(NAME);
     const auto node = ::Config::animationTree()->getAnimationPropertyConfig("windowsMove");
     const auto values = node && node->pValues ? node->pValues.lock() : node;
@@ -618,7 +621,7 @@ bool getAnimationEnabled() {
 
 float getAnimationSpeed() {
     constexpr auto NAME = "plugin:spatialoverview:animation:speed";
-    if (!getValue<bool>("plugin:spatialoverview:animation:inherit") || ::Config::mgr()->getConfigValue(NAME).setByUser)
+    if (!getValue<bool>("plugin:spatialoverview:animation:inherit") || setByUser(NAME))
         return std::clamp(getValue<float>(NAME), 0.1F, 30.F);
     const auto node = ::Config::animationTree()->getAnimationPropertyConfig("windowsMove");
     const auto values = node && node->pValues ? node->pValues.lock() : node;
@@ -627,7 +630,7 @@ float getAnimationSpeed() {
 
 std::string getAnimationBezier() {
     constexpr auto NAME = "plugin:spatialoverview:animation:bezier";
-    if (!getValue<bool>("plugin:spatialoverview:animation:inherit") || ::Config::mgr()->getConfigValue(NAME).setByUser)
+    if (!getValue<bool>("plugin:spatialoverview:animation:inherit") || setByUser(NAME))
         return getValue<std::string>(NAME);
     const auto node = ::Config::animationTree()->getAnimationPropertyConfig("windowsMove");
     const auto values = node && node->pValues ? node->pValues.lock() : node;
@@ -636,12 +639,12 @@ std::string getAnimationBezier() {
 
 ::Config::CGradientValueData getCanvasAccent() {
     constexpr auto NAME = "plugin:spatialoverview:canvas:accent";
-    return getValue<::Config::CGradientValueData>(::Config::mgr()->getConfigValue(NAME).setByUser ? NAME : "general:col.active_border");
+    return getValue<::Config::CGradientValueData>(setByUser(NAME) ? NAME : "general:col.active_border");
 }
 
 CHyprColor getCanvasPanelColor() {
     constexpr auto NAME = "plugin:spatialoverview:canvas:panel_color";
-    const auto gradient = getValue<::Config::CGradientValueData>(::Config::mgr()->getConfigValue(NAME).setByUser ? NAME : "general:col.inactive_border");
+    const auto gradient = getValue<::Config::CGradientValueData>(setByUser(NAME) ? NAME : "general:col.inactive_border");
     return gradient.m_colors.empty() ? CHyprColor{0, 0, 0, 0} : gradient.m_colors.front();
 }
 
@@ -991,7 +994,7 @@ int getShadowRenderPower() {
 std::optional<::Config::CGradientValueData> getShadowColor() {
     constexpr auto NAME = "plugin:spatialoverview:shadow:color";
 
-    if (!::Config::mgr()->getConfigValue(NAME).setByUser)
+    if (!setByUser(NAME))
         return std::nullopt;
 
     return getValue<::Config::CGradientValueData>(NAME);

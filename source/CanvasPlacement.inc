@@ -2,28 +2,22 @@
 PHLWINDOW CScrollOverview::canvasDialogParent(PHLWINDOW window) const {
     if (!window)
         return {};
-    for (const auto& candidate : Desktop::windowState()->windows()) {
-        if (candidate == window || (!shouldShowOverviewWindow(candidate) && !g_canvasPendingWindows.contains(candidate->m_stableID)))
-            continue;
-        if (window->m_isX11 && window->m_xwaylandSurface && candidate->m_xwaylandSurface && window->m_xwaylandSurface->m_parent == candidate->m_xwaylandSurface)
-            return candidate;
-        if (!window->m_isX11 && window->m_xdgSurface && window->m_xdgSurface->m_toplevel && candidate->m_xdgSurface &&
-            window->m_xdgSurface->m_toplevel->m_parent == candidate->m_xdgSurface->m_toplevel)
-            return candidate;
-    }
+    const auto parent = window->backend().parent();
+    if (parent && (shouldShowOverviewWindow(parent) || g_canvasPendingWindows.contains(parent->metadata().stableID())))
+        return parent;
     return {};
 }
 
 bool CScrollOverview::queueCanvasWindow(PHLWINDOW window) {
-    if (!isCanvasDesktop() || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:spawn_on_open") || !shouldShowOverviewWindow(window) || window->m_pinned ||
+    if (!isCanvasDesktop() || !ScrollOverview::Config::getValue<bool>("plugin:spatialoverview:canvas:spawn_on_open") || !shouldShowOverviewWindow(window) || (window->m_state & Desktop::View::WINDOW_STATE_PINNED) ||
         canvasCompositorDndActive())
         return false;
     const auto parent = canvasDialogParent(window);
     if (!manageCanvasWindow(window, false) || !window->layoutTarget())
         return false;
     if (parent && parent->layoutTarget()) {
-        if (g_canvasPendingWindows.contains(parent->m_stableID)) {
-            g_canvasPendingWindows.insert(window->m_stableID);
+        if (g_canvasPendingWindows.contains(parent->metadata().stableID())) {
+            g_canvasPendingWindows.insert(window->metadata().stableID());
             pendingDialogs.emplace_back(window, parent);
             return true;
         }
@@ -36,7 +30,7 @@ bool CScrollOverview::queueCanvasWindow(PHLWINDOW window) {
     // A region deliberately drawn before launching also satisfies placement.
     if (!regionArmed && spawnRegion && applySpawnRegion(window))
         return true;
-    g_canvasPendingWindows.insert(window->m_stableID);
+    g_canvasPendingWindows.insert(window->metadata().stableID());
     pendingRegions.push_back(window);
     stopCanvasMotion();
     if (pendingRegions.size() == 1)
@@ -63,7 +57,7 @@ void CScrollOverview::revealPendingDialogs(PHLWINDOW parent) {
                 children.push_back(window);
     std::erase_if(pendingDialogs, [&](const auto& item) { return !item.first || item.second.lock() == parent; });
     for (const auto& window : children) {
-        g_canvasPendingWindows.erase(window->m_stableID);
+        g_canvasPendingWindows.erase(window->metadata().stableID());
         if (!Desktop::View::validMapped(window))
             continue;
         placeCanvasDialog(window, parent);
@@ -77,7 +71,7 @@ void CScrollOverview::revealPendingDialogs(PHLWINDOW parent) {
 void CScrollOverview::startNextPendingRegion() {
     while (!pendingRegions.empty() && !Desktop::View::validMapped(pendingRegions.front().lock())) {
         if (const auto w = pendingRegions.front().lock())
-            g_canvasPendingWindows.erase(w->m_stableID);
+            g_canvasPendingWindows.erase(w->metadata().stableID());
         pendingRegions.erase(pendingRegions.begin());
     }
     if (pendingRegions.empty()) {
@@ -103,7 +97,7 @@ void CScrollOverview::finishPendingRegion(bool automatic) {
     const auto w = pendingRegions.front().lock();
     pendingRegions.erase(pendingRegions.begin());
     if (w)
-        g_canvasPendingWindows.erase(w->m_stableID);
+        g_canvasPendingWindows.erase(w->metadata().stableID());
     if (Desktop::View::validMapped(w) && w->layoutTarget()) {
         if (automatic) {
             resetSpawnRegion();
@@ -137,7 +131,7 @@ void CScrollOverview::forgetPendingRegion(PHLWINDOW window) {
     if (!window)
         return;
     const bool first = !pendingRegions.empty() && pendingRegions.front().lock() == window;
-    g_canvasPendingWindows.erase(window->m_stableID);
+    g_canvasPendingWindows.erase(window->metadata().stableID());
     std::erase_if(pendingRegions, [&](const auto& ref) { return !ref || ref.lock() == window; });
     std::erase_if(pendingDialogs, [&](const auto& item) { return !item.first || item.first.lock() == window; });
     revealPendingDialogs(window);
@@ -150,11 +144,11 @@ void CScrollOverview::forgetPendingRegion(PHLWINDOW window) {
 void CScrollOverview::clearPendingRegions() {
     for (const auto& ref : pendingRegions)
         if (const auto w = ref.lock())
-            g_canvasPendingWindows.erase(w->m_stableID);
+            g_canvasPendingWindows.erase(w->metadata().stableID());
     pendingRegions.clear();
     for (const auto& [child, parent] : pendingDialogs)
         if (const auto w = child.lock())
-            g_canvasPendingWindows.erase(w->m_stableID);
+            g_canvasPendingWindows.erase(w->metadata().stableID());
     pendingDialogs.clear();
     // No placement on shutdown: the native layout restoration owns geometry.
     regionArmed   = false;

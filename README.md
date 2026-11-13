@@ -4,7 +4,7 @@
 
 An infinite canvas for Hyprland, with a hotkey to switch back to tiling. Inspired by [Lilith](https://github.com/ohto121/lilith) and built on a locally adapted [Phantomat](https://github.com/kaolti/phantomat) renderer.
 
-**0.2 development snapshot.** The plugin targets **Hyprland 0.56.2 with Lua configuration and dwindle**, independently of any desktop preset. Serpantinum is not required. Other compositor versions/layouts need separate validation. A single physical monitor is sufficient.
+**0.2 development snapshot.** The plugin targets **Hyprland 0.57.0 with Lua configuration and dwindle**, independently of any desktop preset. Serpantinum is not required. Other compositor versions/layouts need separate validation. A single physical monitor is sufficient.
 
 ![Three synthetic Wayland terminal windows on the HotLilith canvas](docs/assets/preview.png)
 
@@ -25,7 +25,8 @@ Pinned windows and special workspaces are excluded. Normal workspace switching c
 
 | Component | Current requirement |
 |---|---|
-| Compositor | Hyprland **0.56.2**, matching development headers and running ABI |
+| Compositor | Hyprland **0.57.0**, matching development headers and running ABI |
+| Dependencies | Resolve the requirements of `pkg-config --print-errors --exists hyprland`, including hyprutils **>= 0.14.3** |
 | Desktop preset | None required; Lua `hyprland.lua` and dwindle |
 | Compiler | GCC 15+; the renderer uses `#embed` |
 | Build tools | Make, pkg-config, Python 3, binutils (`strip`) |

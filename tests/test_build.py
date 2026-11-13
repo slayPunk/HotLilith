@@ -83,6 +83,19 @@ print(json.dumps({'abiHash':os.environ.get('TEST_RUNNING_ABI',os.environ['TEST_H
         self.assertEqual((self.root/'spatialoverview.so').read_bytes(), binary)
         self.assertEqual((self.root/'build-version.json').read_bytes(), metadata)
 
+    def test_missing_dependencies_preserve_previous_build(self):
+        first = self.build('abi-a')
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        binary = (self.root/'spatialoverview.so').read_bytes()
+        metadata = (self.root/'build-version.json').read_bytes()
+        (self.bin/'pkg-config').write_text('#!/bin/sh\necho "missing development dependency" >&2\nexit 1\n')
+        result = self.build('abi-b')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('missing development dependency', result.stderr)
+        self.assertFalse((self.root/'source/.build/obj/abi-b').exists())
+        self.assertEqual((self.root/'spatialoverview.so').read_bytes(), binary)
+        self.assertEqual((self.root/'build-version.json').read_bytes(), metadata)
+
 
 if __name__ == '__main__':
     unittest.main()

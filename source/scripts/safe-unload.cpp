@@ -19,8 +19,8 @@
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprland/src/layout/LayoutManager.hpp>
 #include <hyprland/src/layout/space/Space.hpp>
 #include <hyprland/src/layout/target/Target.hpp>
@@ -52,7 +52,7 @@ namespace {
     SPass repair() {
         SPass pass;
         for (const auto& w : Desktop::windowState()->windows()) {
-            if (!w || !w->m_isMapped)
+            if (!w || !w->mapped())
                 continue;
             const auto TARGET = w->layoutTarget();
             const auto FROM   = TARGET ? TARGET->space() : nullptr;
@@ -60,17 +60,17 @@ namespace {
                 continue;
             ++pass.checked;
             const auto WS = w->m_workspace;
-            if (valid(WS) && FROM == WS->m_space && FROM->workspace() == WS)
+            if (valid(WS) && FROM == WS->space() && FROM->workspace() == WS)
                 continue;
             // Pinned windows follow the monitor on their own; leave them unless stranded.
-            if (w->m_pinned && FROM->workspace())
+            if ((w->m_state & Desktop::View::WINDOW_STATE_PINNED) && FROM->workspace())
                 continue;
-            const bool PLACEABLE = valid(WS) && WS->m_space && (TARGET->floating() || (WS->m_monitor && Desktop::focusState()->monitor()));
+            const bool PLACEABLE = valid(WS) && WS->space() && (TARGET->floating() || (WS->m_monitor && Desktop::focusState()->monitor()));
             if (!PLACEABLE || !safeToDetach(TARGET, FROM)) {
                 ++pass.unresolved;
                 continue;
             }
-            g_layoutManager->newTarget(TARGET, WS->m_space);
+            g_layoutManager->newTarget(TARGET, WS->space());
             ++pass.repaired;
         }
         return pass;

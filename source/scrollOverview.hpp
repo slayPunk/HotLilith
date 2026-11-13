@@ -1,4 +1,5 @@
 #pragma once
+#include <hyprland/src/input/Keys.hpp>
 
 #define WLR_USE_UNSTABLE
 
@@ -68,8 +69,8 @@ class CScrollOverview : public IOverview {
     void         refreshCanvasSettings();
     bool         flightDeckAction(const std::string& action);
     bool         canvasPlaceAction(const std::string& action);
-    bool   tunerKeyAction(uint32_t keysym, uint32_t mods, const std::string& text);
-    bool         navigatorKeyAction(uint32_t keysym, uint32_t mods, const std::string& text, bool repeat);
+    bool   tunerKeyAction(uint32_t keysym, Input::ModifierMask mods, const std::string& text);
+    bool         navigatorKeyAction(uint32_t keysym, Input::ModifierMask mods, const std::string& text, bool repeat);
     bool         openNavigator(const std::string& query = {});
     void         landOnWindow(PHLWINDOW window);
     void         summonWindow(PHLWINDOW window);
@@ -191,14 +192,14 @@ class CScrollOverview : public IOverview {
     void   renderCanvasGrid(PHLMONITOR monitor, size_t activeIdx, float workspacePitch, float renderScale);
     void   renderCanvasMinimap(PHLMONITOR monitor);
     void   renderExperimentChrome(PHLMONITOR monitor);
-    bool   handleExperimentKey(uint32_t keysym, uint32_t mods);
+    bool   handleExperimentKey(uint32_t keysym, Input::ModifierMask mods);
     bool   handleExperimentClick(uint32_t button, uint32_t state, const Vector2D& rawLocal);
     void   updateExperimentDrag();
     bool   jumpCanvasMinimap(const Vector2D& rawLocal);
     CBox   currentCanvasViewportWorld() const;
     void   commitLanding();
     void   revertNavigation();
-    bool   handleNavigatorKey(const IKeyboard::SKeyEvent& event, uint32_t keysym, uint32_t mods);
+    bool   handleNavigatorKey(const IKeyboard::SKeyEvent& event, uint32_t keysym, Input::ModifierMask mods);
     void   followNavigatorSelection();
     bool   navigatorOwnsPointer() const;
     bool   showsNavigatorHud() const;
@@ -338,10 +339,10 @@ class CScrollOverview : public IOverview {
 
     struct SWorkspaceInsertTransition {
         bool                             active              = false;
-        WORKSPACEID                      transitionWorkspaceID = WORKSPACE_INVALID;
+        std::string                      transitionWorkspaceID = std::string{};
         bool                             transitionFadeIn   = true;
-        std::unordered_map<WORKSPACEID, float> oldRelativeOffsets;
-        std::unordered_map<WORKSPACEID, float> newRelativeOffsets;
+        std::unordered_map<std::string, float> oldRelativeOffsets;
+        std::unordered_map<std::string, float> newRelativeOffsets;
         float                            transitionOldRelativeOffset = 0.F;
     };
 
@@ -368,7 +369,7 @@ class CScrollOverview : public IOverview {
     CBox                             dragOriginalOverviewBox    = CBox{};
     CBox                             dragOriginalOverviewHitbox = CBox{};
     CBox                             resizeOriginalBox          = CBox{};
-    WORKSPACEID                      focusSyncedFromWorkspaceID = WORKSPACE_INVALID;
+    std::string                      focusSyncedFromWorkspaceID = std::string{};
     size_t                           resizeWorkspaceIdx     = 0;
     Layout::eRectCorner              resizeCorner           = Layout::CORNER_NONE;
     bool                             dragPendingPrimary    = false;
@@ -395,7 +396,7 @@ class CScrollOverview : public IOverview {
 
     std::vector<SP<SWorkspaceImage>> images;
     std::vector<PHLWINDOWREF>        pinnedFloatingWindows;
-    std::unordered_map<WORKSPACEID, PHLWINDOWREF> rememberedSelection;
+    std::unordered_map<std::string, PHLWINDOWREF> rememberedSelection;
     SWorkspaceInsertTransition       workspaceInsertTransition;
     PHLWORKSPACEREF                  pendingRemovedWorkspace;
     ScrollOverview::Config::ELayout  layout = ScrollOverview::Config::ELayout::VERTICAL;

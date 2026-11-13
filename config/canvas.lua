@@ -1,4 +1,4 @@
--- HotLilith settings and lifecycle for Hyprland 0.56.2. No key bindings.
+-- HotLilith settings and lifecycle for Hyprland 0.57.0. No key bindings.
 -- The renderer is a locally patched Phantomat, with its original license.
 local loaded = false
 for _, plugin in ipairs(hl.get_loaded_plugins()) do
@@ -42,11 +42,11 @@ hl.config({ plugin = { spatialoverview = {
 local exit_timer
 hl.on("workspace.active", function()
   local s, ws = state(), hl.get_active_workspace()
-  if s.active and s.scope == "workspace" and ws and ws.id ~= s.workspace_id then
+  if s.active and s.scope == "workspace" and ws and ws.addressable_name ~= s.workspace_address then
     exit_timer = hl.timer(function()
       local current, current_ws = state(), hl.get_active_workspace()
       if current.active and current.scope == "workspace" and current_ws and
-          current_ws.id ~= current.workspace_id then hl.plugin.spatialoverview._dispatch("mode", "off") end
+          current_ws.addressable_name ~= current.workspace_address then hl.plugin.spatialoverview._dispatch("mode", "off") end
     end, { type = "oneshot", timeout = 1 })
   end
 end)
