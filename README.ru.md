@@ -182,6 +182,6 @@ python3 install.py --enable
 
 Разрабатывает [slayPunk](https://github.com/slayPunk). Идея вдохновлена [Lilith](https://github.com/ohto121/lilith), рендерер основан на [Phantomat](https://github.com/kaolti/phantomat).
 
-Нашли проблему или есть предложение? - [Telegram](https://t.me/ashwagandha4)
+Нашли проблему или есть предложение? - [Telegram: @ashwagandha4](https://t.me/ashwagandha4)
 
 [BSD-3-Clause](LICENSE) · [Авторство компонентов](NOTICE.md) · [Источники](UPSTREAM.md)
